@@ -3,7 +3,7 @@
 set -ex         # Exit on error; debugging enabled.
 set -o pipefail # Fail a pipe if any sub-command fails.
 
-source "$(dirname $0)/vet-common.sh"
+source "$(dirname $0)/common.sh"
 
 # Check to make sure it's safe to modify the user's git repo.
 git status --porcelain | fail_on_output
@@ -30,7 +30,8 @@ if [[ "$1" = "-install" ]]; then
   go install \
     golang.org/x/tools/cmd/goimports \
     honnef.co/go/tools/cmd/staticcheck \
-    github.com/client9/misspell/cmd/misspell
+    github.com/client9/misspell/cmd/misspell \
+    github.com/mgechev/revive
   popd
   exit 0
 elif [[ "$#" -ne 0 ]]; then
@@ -69,6 +70,13 @@ not git grep "\(import \|^\s*\)\"google.golang.org/grpc/interop/grpc_testing" --
 # - Ensure all xds proto imports are renamed to *pb or *grpc.
 git grep '"github.com/envoyproxy/go-control-plane/envoy' -- '*.go' ':(exclude)*.pb.go' | not grep -v 'pb "\|grpc "'
 
+# - Ensure all context usages are done with timeout.
+# Context tests under benchmark are excluded as they are testing the performance of context.Background() and context.TODO().
+# TODO: Remove the exclusions once the tests are updated to use context.WithTimeout().
+# See https://github.com/grpc/grpc-go/issues/7304
+git grep -e 'context.Background()' --or -e 'context.TODO()' -- "*_test.go" | grep -v "benchmark/primitives/context_test.go" | grep -v "credential
+s/google" | grep -v "internal/transport/" | grep -v "xds/internal/" | grep -v "security/advancedtls" | grep -v 'context.WithTimeout(' | not grep -v 'context.WithCancel('
+
 misspell -error .
 
 # - gofmt, goimports, go vet, go mod tidy.
@@ -83,7 +91,7 @@ for MOD_FILE in $(find . -name 'go.mod'); do
   go mod tidy -compat=1.21
   git status --porcelain 2>&1 | fail_on_output || \
     (git status; git --no-pager diff; exit 1)
-  
+
   # - Collection of static analysis checks
   SC_OUT="$(mktemp)"
   staticcheck -go 1.21 -checks 'all' ./... >"${SC_OUT}" || true
@@ -114,7 +122,7 @@ XXXXX PleaseIgnoreUnused'
 
   # Ignore a false positive when operands have side affectes.
   # TODO(https://github.com/dominikh/go-tools/issues/54): Remove this once the issue is fixed in staticcheck.
-  noret_grep "(SA4000)" "${SC_OUT}" | not grep -ev "crl.go:\d*:\d*: identical expressions on the left and right side of the '||' operator (SA4000)"
+  noret_grep "(SA4000)" "${SC_OUT}" | not grep -v -e "crl.go:[0-9]\+:[0-9]\+: identical expressions on the left and right side of the '||' operator (SA4000)"
 
   # Only ignore the following deprecated types/fields/functions and exclude
   # generated code.
@@ -159,5 +167,13 @@ GetValidationContextCertificateProviderInstance
 XXXXX PleaseIgnoreUnused'
   popd
 done
+
+# Collection of revive linter analysis checks
+REV_OUT="$(mktemp)"
+revive -formatter plain ./... >"${REV_OUT}" || true
+
+# Error for anything other than unused-parameter linter check and in generated code.
+# TODO: Remove `|| true` to unskip linter failures once existing issues are fixed.
+(noret_grep -v "unused-parameter" "${REV_OUT}" | not grep -v "\.pb\.go:") || true
 
 echo SUCCESS
