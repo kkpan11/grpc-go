@@ -16,7 +16,8 @@
  *
  */
 
-// Binary client is an example client.
+// Binary client demonstrates the use of a custom LB policy that handles ORCA
+// per-call and out-of-band metrics for load reporting.
 package main
 
 import (
@@ -59,7 +60,7 @@ func main() {
 	ticker := time.NewTicker(time.Second)
 	for range ticker.C {
 		func() {
-			// Use an anonymous function to ensure context cancelation via defer.
+			// Use an anonymous function to ensure context cancellation via defer.
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 			defer cancel()
 			if _, err := c.UnaryEcho(ctx, &pb.EchoRequest{Message: "test echo message"}); err != nil {
@@ -82,7 +83,7 @@ func init() {
 type orcaLBBuilder struct{}
 
 func (orcaLBBuilder) Name() string { return "orca_example" }
-func (orcaLBBuilder) Build(cc balancer.ClientConn, opts balancer.BuildOptions) balancer.Balancer {
+func (orcaLBBuilder) Build(cc balancer.ClientConn, _ balancer.BuildOptions) balancer.Balancer {
 	return &orcaLB{cc: cc}
 }
 
@@ -94,6 +95,7 @@ func (orcaLBBuilder) Build(cc balancer.ClientConn, opts balancer.BuildOptions) b
 // designed to run within.
 type orcaLB struct {
 	cc balancer.ClientConn
+	sc balancer.SubConn
 }
 
 func (o *orcaLB) UpdateClientConnState(ccs balancer.ClientConnState) error {
@@ -111,6 +113,7 @@ func (o *orcaLB) UpdateClientConnState(ccs balancer.ClientConnState) error {
 		return fmt.Errorf("orcaLB: error creating SubConn: %v", err)
 	}
 	sc.Connect()
+	o.sc = sc
 
 	// Register a simple ORCA OOB listener on the SubConn.  We request a 1
 	// second report interval, but in this example the server indicated the
@@ -123,8 +126,14 @@ func (o *orcaLB) UpdateClientConnState(ccs balancer.ClientConnState) error {
 
 func (o *orcaLB) ResolverError(error) {}
 
+func (o *orcaLB) ExitIdle() {
+	if o.sc != nil {
+		o.sc.Connect()
+	}
+}
+
 // TODO: unused; remove when no longer required.
-func (o *orcaLB) UpdateSubConnState(sc balancer.SubConn, scs balancer.SubConnState) {}
+func (o *orcaLB) UpdateSubConnState(balancer.SubConn, balancer.SubConnState) {}
 
 func (o *orcaLB) Close() {}
 
@@ -132,7 +141,7 @@ type picker struct {
 	sc balancer.SubConn
 }
 
-func (p *picker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
+func (p *picker) Pick(balancer.PickInfo) (balancer.PickResult, error) {
 	return balancer.PickResult{
 		SubConn: p.sc,
 		Done: func(di balancer.DoneInfo) {

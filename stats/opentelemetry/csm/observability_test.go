@@ -21,6 +21,7 @@ package csm
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"testing"
@@ -29,11 +30,12 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/balancer"
+	"google.golang.org/grpc/balancer/base"
 	"google.golang.org/grpc/encoding/gzip"
+	estats "google.golang.org/grpc/experimental/stats"
 	istats "google.golang.org/grpc/internal/stats"
 	"google.golang.org/grpc/internal/stubserver"
-	"google.golang.org/grpc/internal/testutils"
-	"google.golang.org/grpc/internal/testutils/xds/e2e"
 	testgrpc "google.golang.org/grpc/interop/grpc_testing"
 	testpb "google.golang.org/grpc/interop/grpc_testing"
 	"google.golang.org/grpc/metadata"
@@ -45,13 +47,12 @@ import (
 // the bootstrap env var to a bootstrap file with a nodeID provided. It sets CSM
 // Env Vars as well, and mocks the resource detector's returned attribute set to
 // simulate the environment. It registers a cleanup function on the provided t
-// to restore the environment to it's original state.
-func setupEnv(t *testing.T, resourceDetectorEmissions map[string]string, nodeID, csmCanonicalServiceName, csmWorkloadName string) {
-	bootstrapContents := e2e.DefaultBootstrapContents(t, nodeID, "xds_server_uri")
-	testutils.CreateBootstrapFileForTesting(t, bootstrapContents)
-
+// to restore the environment to its original state.
+func setupEnv(t *testing.T, resourceDetectorEmissions map[string]string, meshID, csmCanonicalServiceName, csmWorkloadName string) {
+	oldCSMMeshID, csmMeshIDPresent := os.LookupEnv("CSM_MESH_ID")
 	oldCSMCanonicalServiceName, csmCanonicalServiceNamePresent := os.LookupEnv("CSM_CANONICAL_SERVICE_NAME")
 	oldCSMWorkloadName, csmWorkloadNamePresent := os.LookupEnv("CSM_WORKLOAD_NAME")
+	os.Setenv("CSM_MESH_ID", meshID)
 	os.Setenv("CSM_CANONICAL_SERVICE_NAME", csmCanonicalServiceName)
 	os.Setenv("CSM_WORKLOAD_NAME", csmWorkloadName)
 
@@ -67,6 +68,11 @@ func setupEnv(t *testing.T, resourceDetectorEmissions map[string]string, nodeID,
 		return &attrSet
 	}
 	t.Cleanup(func() {
+		if csmMeshIDPresent {
+			os.Setenv("CSM_MESH_ID", oldCSMMeshID)
+		} else {
+			os.Unsetenv("CSM_MESH_ID")
+		}
 		if csmCanonicalServiceNamePresent {
 			os.Setenv("CSM_CANONICAL_SERVICE_NAME", oldCSMCanonicalServiceName)
 		} else {
@@ -99,10 +105,10 @@ func (s) TestCSMPluginOptionUnary(t *testing.T) {
 		"k8s.namespace.name": "k8s_namespace_name_val",
 		"k8s.cluster.name":   "k8s_cluster_name_val",
 	}
-	const nodeID = "projects/12345/networks/mesh:mesh_id/nodes/aaaa-aaaa-aaaa-aaaa"
+	const meshID = "mesh_id"
 	const csmCanonicalServiceName = "csm_canonical_service_name"
 	const csmWorkloadName = "csm_workload_name"
-	setupEnv(t, resourceDetectorEmissions, nodeID, csmCanonicalServiceName, csmWorkloadName)
+	setupEnv(t, resourceDetectorEmissions, meshID, csmCanonicalServiceName, csmWorkloadName)
 
 	attributesWant := map[string]string{
 		"csm.workload_canonical_service": csmCanonicalServiceName, // from env
@@ -125,6 +131,7 @@ func (s) TestCSMPluginOptionUnary(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
+	unaryCompressedSize := float64(itestutils.GzipCompressedMessageSize(t, &testpb.SimpleRequest{Payload: &testpb.Payload{Body: make([]byte, 10000)}}))
 	tests := []struct {
 		name string
 		// To test the different operations for Unary RPC's from the interceptor
@@ -134,19 +141,19 @@ func (s) TestCSMPluginOptionUnary(t *testing.T) {
 	}{
 		{
 			name: "normal-flow",
-			unaryCallFunc: func(ctx context.Context, in *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+			unaryCallFunc: func(_ context.Context, in *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
 				return &testpb.SimpleResponse{Payload: &testpb.Payload{
 					Body: make([]byte, len(in.GetPayload().GetBody())),
 				}}, nil
 			},
 			opts: itestutils.MetricDataOptions{
 				CSMLabels:                  csmLabels,
-				UnaryCompressedMessageSize: float64(57),
+				UnaryCompressedMessageSize: unaryCompressedSize,
 			},
 		},
 		{
 			name: "trailers-only",
-			unaryCallFunc: func(ctx context.Context, in *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+			unaryCallFunc: func(context.Context, *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
 				return nil, errors.New("some error") // return an error and no message - this triggers trailers only - no messages or headers sent
 			},
 			opts: itestutils.MetricDataOptions{
@@ -165,7 +172,7 @@ func (s) TestCSMPluginOptionUnary(t *testing.T) {
 			},
 			opts: itestutils.MetricDataOptions{
 				CSMLabels:                  csmLabels,
-				UnaryCompressedMessageSize: float64(57),
+				UnaryCompressedMessageSize: unaryCompressedSize,
 			},
 		},
 		{
@@ -179,19 +186,19 @@ func (s) TestCSMPluginOptionUnary(t *testing.T) {
 			},
 			opts: itestutils.MetricDataOptions{
 				CSMLabels:                  csmLabels,
-				UnaryCompressedMessageSize: float64(57),
+				UnaryCompressedMessageSize: unaryCompressedSize,
 			},
 		},
 		{
 			name: "send-msg",
-			unaryCallFunc: func(ctx context.Context, in *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+			unaryCallFunc: func(_ context.Context, in *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
 				return &testpb.SimpleResponse{Payload: &testpb.Payload{
 					Body: make([]byte, len(in.GetPayload().GetBody())),
 				}}, nil
 			},
 			opts: itestutils.MetricDataOptions{
 				CSMLabels:                  csmLabels,
-				UnaryCompressedMessageSize: float64(57),
+				UnaryCompressedMessageSize: unaryCompressedSize,
 			},
 		},
 	}
@@ -206,13 +213,13 @@ func (s) TestCSMPluginOptionUnary(t *testing.T) {
 				serverOptionWithCSMPluginOption(opentelemetry.Options{
 					MetricsOptions: opentelemetry.MetricsOptions{
 						MeterProvider: provider,
-						Metrics:       opentelemetry.DefaultMetrics,
+						Metrics:       opentelemetry.DefaultMetrics(),
 					}}, po),
 			}
 			dopts := []grpc.DialOption{dialOptionWithCSMPluginOption(opentelemetry.Options{
 				MetricsOptions: opentelemetry.MetricsOptions{
 					MeterProvider:  provider,
-					Metrics:        opentelemetry.DefaultMetrics,
+					Metrics:        opentelemetry.DefaultMetrics(),
 					OptionalLabels: []string{"csm.service_name", "csm.service_namespace_name"},
 				},
 			}, po)}
@@ -244,7 +251,8 @@ func (s) TestCSMPluginOptionUnary(t *testing.T) {
 			opts := test.opts
 			opts.Target = ss.Target
 			wantMetrics := itestutils.MetricDataUnary(opts)
-			itestutils.CompareMetrics(ctx, t, reader, gotMetrics, wantMetrics)
+			gotMetrics = itestutils.WaitForServerMetrics(ctx, t, reader, gotMetrics, wantMetrics)
+			itestutils.CompareMetrics(t, gotMetrics, wantMetrics)
 		})
 	}
 }
@@ -266,10 +274,10 @@ func (s) TestCSMPluginOptionStreaming(t *testing.T) {
 		"k8s.namespace.name": "k8s_namespace_name_val",
 		"k8s.cluster.name":   "k8s_cluster_name_val",
 	}
-	const nodeID = "projects/12345/networks/mesh:mesh_id/nodes/aaaa-aaaa-aaaa-aaaa"
+	const meshID = "mesh_id"
 	const csmCanonicalServiceName = "csm_canonical_service_name"
 	const csmWorkloadName = "csm_workload_name"
-	setupEnv(t, resourceDetectorEmissions, nodeID, csmCanonicalServiceName, csmWorkloadName)
+	setupEnv(t, resourceDetectorEmissions, meshID, csmCanonicalServiceName, csmWorkloadName)
 
 	attributesWant := map[string]string{
 		"csm.workload_canonical_service": csmCanonicalServiceName, // from env
@@ -292,6 +300,7 @@ func (s) TestCSMPluginOptionStreaming(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
+	streamingCompressedSize := float64(itestutils.GzipCompressedMessageSize(t, &testpb.StreamingOutputCallRequest{Payload: &testpb.Payload{Body: make([]byte, 10000)}}))
 	tests := []struct {
 		name string
 		// To test the different operations for Streaming RPC's from the
@@ -354,7 +363,7 @@ func (s) TestCSMPluginOptionStreaming(t *testing.T) {
 			},
 			opts: itestutils.MetricDataOptions{
 				CSMLabels:                      csmLabels,
-				StreamingCompressedMessageSize: float64(57),
+				StreamingCompressedMessageSize: streamingCompressedSize,
 			},
 		},
 	}
@@ -368,13 +377,13 @@ func (s) TestCSMPluginOptionStreaming(t *testing.T) {
 				serverOptionWithCSMPluginOption(opentelemetry.Options{
 					MetricsOptions: opentelemetry.MetricsOptions{
 						MeterProvider: provider,
-						Metrics:       opentelemetry.DefaultMetrics,
+						Metrics:       opentelemetry.DefaultMetrics(),
 					}}, po),
 			}
 			dopts := []grpc.DialOption{dialOptionWithCSMPluginOption(opentelemetry.Options{
 				MetricsOptions: opentelemetry.MetricsOptions{
 					MeterProvider:  provider,
-					Metrics:        opentelemetry.DefaultMetrics,
+					Metrics:        opentelemetry.DefaultMetrics(),
 					OptionalLabels: []string{"csm.service_name", "csm.service_namespace_name"},
 				},
 			}, po)}
@@ -417,39 +426,29 @@ func (s) TestCSMPluginOptionStreaming(t *testing.T) {
 			opts := test.opts
 			opts.Target = ss.Target
 			wantMetrics := itestutils.MetricDataStreaming(opts)
-			itestutils.CompareMetrics(ctx, t, reader, gotMetrics, wantMetrics)
+			gotMetrics = itestutils.WaitForServerMetrics(ctx, t, reader, gotMetrics, wantMetrics)
+			itestutils.CompareMetrics(t, gotMetrics, wantMetrics)
 		})
 	}
 }
 
-func unaryInterceptorAttachXDSLabels(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
-	ctx = istats.SetLabels(ctx, &istats.Labels{
-		TelemetryLabels: map[string]string{
-			// mock what the cluster impl would write here ("csm." xDS Labels)
-			"csm.service_name":           "service_name_val",
-			"csm.service_namespace_name": "service_namespace_val",
-		},
-	})
-
-	// TagRPC will just see this in the context and set it's xDS Labels to point
-	// to this map on the heap.
-	return invoker(ctx, method, req, reply, cc, opts...)
-}
-
 // TestXDSLabels tests that xDS Labels get emitted from OpenTelemetry metrics.
 // This test configures OpenTelemetry with the CSM Plugin Option, and xDS
-// Optional Labels turned on. It then configures an interceptor to attach
-// labels, representing the cluster_impl picker. It then makes a unary RPC, and
+// Optional Labels turned on. It then configures a test balancer that updates
+// labels, simulating the cluster_impl picker. It then makes a unary RPC, and
 // expects xDS Labels labels to be attached to emitted relevant metrics. Full
-// xDS System alongside OpenTelemetry will be tested with interop. (there is
-// a test for xDS -> Stats handler and this tests -> OTel -> emission).
+// xDS System alongside OpenTelemetry will be tested with interop. (there is a
+// test for xDS -> Stats handler and this tests -> OTel -> emission). It also
+// tests the optional per call locality label in the same manner.
 func (s) TestXDSLabels(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
+	balancerName := "o11y_balancer_xds_labels"
+	balancer.Register(base.NewBalancerBuilder(balancerName, &o11yPickerBuilder{}, base.Config{}))
 	reader := metric.NewManualReader()
 	provider := metric.NewMeterProvider(metric.WithReader(reader))
 	ss := &stubserver.StubServer{
-		UnaryCallF: func(ctx context.Context, in *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+		UnaryCallF: func(_ context.Context, in *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
 			return &testpb.SimpleResponse{Payload: &testpb.Payload{
 				Body: make([]byte, len(in.GetPayload().GetBody())),
 			}}, nil
@@ -457,19 +456,20 @@ func (s) TestXDSLabels(t *testing.T) {
 	}
 
 	po := newPluginOption(ctx)
-	dopts := []grpc.DialOption{dialOptionWithCSMPluginOption(opentelemetry.Options{
+	sc := fmt.Sprintf(`{"loadBalancingConfig": [{"%s": {}}]}`, balancerName)
+	dopts := []grpc.DialOption{dialOptionSetCSM(opentelemetry.Options{
 		MetricsOptions: opentelemetry.MetricsOptions{
 			MeterProvider:  provider,
-			Metrics:        opentelemetry.DefaultMetrics,
-			OptionalLabels: []string{"csm.service_name", "csm.service_namespace_name"},
+			Metrics:        opentelemetry.DefaultMetrics(),
+			OptionalLabels: []string{"csm.service_name", "csm.service_namespace_name", "grpc.lb.locality", "grpc.lb.backend_service", "grpc.client.call.custom"},
 		},
-	}, po), grpc.WithUnaryInterceptor(unaryInterceptorAttachXDSLabels)}
+	}, po), grpc.WithDefaultServiceConfig(sc)}
 	if err := ss.Start(nil, dopts...); err != nil {
 		t.Fatalf("Error starting endpoint server: %v", err)
 	}
 
 	defer ss.Stop()
-	ss.Client.UnaryCall(ctx, &testpb.SimpleRequest{Payload: &testpb.Payload{
+	ss.Client.UnaryCall(estats.NewContextWithCustomLabel(ctx, "my-custom-label"), &testpb.SimpleRequest{Payload: &testpb.Payload{
 		Body: make([]byte, 10000),
 	}}, grpc.UseCompressor(gzip.Name))
 
@@ -489,10 +489,13 @@ func (s) TestXDSLabels(t *testing.T) {
 
 	serviceNameAttr := attribute.String("csm.service_name", "service_name_val")
 	serviceNamespaceAttr := attribute.String("csm.service_namespace_name", "service_namespace_val")
+	localityAttr := attribute.String("grpc.lb.locality", "grpc.lb.locality_val")
+	backendServiceAttr := attribute.String("grpc.lb.backend_service", "grpc.lb.backend_service_val")
 	meshIDAttr := attribute.String("csm.mesh_id", "unknown")
 	workloadCanonicalServiceAttr := attribute.String("csm.workload_canonical_service", "unknown")
 	remoteWorkloadTypeAttr := attribute.String("csm.remote_workload_type", "unknown")
 	remoteWorkloadCanonicalServiceAttr := attribute.String("csm.remote_workload_canonical_service", "unknown")
+	customLabelAttr := attribute.String("grpc.client.call.custom", "my-custom-label")
 
 	unaryMethodClientSideEnd := []attribute.KeyValue{
 		unaryMethodAttr,
@@ -500,24 +503,31 @@ func (s) TestXDSLabels(t *testing.T) {
 		unaryStatusAttr,
 		serviceNameAttr,
 		serviceNamespaceAttr,
+		localityAttr,
+		backendServiceAttr,
 		meshIDAttr,
 		workloadCanonicalServiceAttr,
 		remoteWorkloadTypeAttr,
 		remoteWorkloadCanonicalServiceAttr,
+		customLabelAttr,
 	}
 
-	unaryCompressedBytesSentRecv := int64(57) // Fixed 10000 bytes with gzip assumption.
+	unaryCompressedBytesSentRecv := int64(itestutils.GzipCompressedMessageSize(t, &testpb.SimpleRequest{
+		Payload: &testpb.Payload{
+			Body: make([]byte, 10000),
+		},
+	})) // Fixed 10000 bytes with gzip.
 	unaryBucketCounts := []uint64{0x0, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}
-	unaryExtrema := metricdata.NewExtrema(int64(57))
+	unaryExtrema := metricdata.NewExtrema(unaryCompressedBytesSentRecv)
 	wantMetrics := []metricdata.Metrics{
 		{
 			Name:        "grpc.client.attempt.started",
 			Description: "Number of client call attempts started.",
-			Unit:        "attempt",
+			Unit:        "{attempt}",
 			Data: metricdata.Sum[int64]{
 				DataPoints: []metricdata.DataPoint[int64]{
 					{
-						Attributes: attribute.NewSet(unaryMethodAttr, targetAttr),
+						Attributes: attribute.NewSet(unaryMethodAttr, targetAttr, customLabelAttr),
 						Value:      1,
 					},
 				},
@@ -585,7 +595,7 @@ func (s) TestXDSLabels(t *testing.T) {
 			Data: metricdata.Histogram[float64]{
 				DataPoints: []metricdata.HistogramDataPoint[float64]{
 					{
-						Attributes: attribute.NewSet(unaryMethodAttr, targetAttr, unaryStatusAttr),
+						Attributes: attribute.NewSet(unaryMethodAttr, targetAttr, unaryStatusAttr, customLabelAttr),
 						Count:      1,
 						Bounds:     itestutils.DefaultLatencyBounds,
 					},
@@ -595,13 +605,45 @@ func (s) TestXDSLabels(t *testing.T) {
 		},
 	}
 
-	itestutils.CompareMetrics(ctx, t, reader, gotMetrics, wantMetrics)
+	gotMetrics = itestutils.WaitForServerMetrics(ctx, t, reader, gotMetrics, wantMetrics)
+	itestutils.CompareMetrics(t, gotMetrics, wantMetrics)
 }
 
 // TestObservability tests that Observability global function compiles and runs
 // without error. The actual functionality of this function will be verified in
 // interop tests.
-func (s) TestObservability(t *testing.T) {
-	cleanup := EnableObservability(context.Background(), opentelemetry.Options{})
+func (s) TestObservability(*testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+
+	cleanup := EnableObservability(ctx, opentelemetry.Options{})
 	cleanup()
+}
+
+type o11yPickerBuilder struct{}
+
+func (*o11yPickerBuilder) Build(info base.PickerBuildInfo) balancer.Picker {
+	return &o11yPicker{info: info}
+}
+
+type o11yPicker struct {
+	info base.PickerBuildInfo
+}
+
+func (p *o11yPicker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
+	// This simulates the behavior of the cluster_impl picker.
+	// It runs after TagRPC has already registered the default telemetry
+	// callback.
+	istats.UpdateLabels(info.Ctx, map[string]string{
+		"csm.service_name":           "service_name_val",
+		"csm.service_namespace_name": "service_namespace_val",
+
+		"grpc.lb.locality":        "grpc.lb.locality_val",
+		"grpc.lb.backend_service": "grpc.lb.backend_service_val",
+	})
+
+	for sc := range p.info.ReadySCs {
+		return balancer.PickResult{SubConn: sc}, nil
+	}
+	return balancer.PickResult{}, balancer.ErrNoSubConnAvailable
 }

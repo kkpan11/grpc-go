@@ -20,11 +20,13 @@ package metadata
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"strconv"
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"google.golang.org/grpc/internal/grpctest"
 )
 
@@ -202,9 +204,11 @@ func (s) TestFromIncomingContext(t *testing.T) {
 	md := Pairs(
 		"X-My-Header-1", "42",
 	)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
 	// Verify that we lowercase if callers directly modify md
 	md["X-INCORRECT-UPPERCASE"] = []string{"foo"}
-	ctx := NewIncomingContext(context.Background(), md)
+	ctx = NewIncomingContext(ctx, md)
 
 	result, found := FromIncomingContext(ctx)
 	if !found {
@@ -238,9 +242,11 @@ func (s) TestValueFromIncomingContext(t *testing.T) {
 		"X-My-Header-2", "43-2",
 		"x-my-header-3", "44",
 	)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
 	// Verify that we lowercase if callers directly modify md
 	md["X-INCORRECT-UPPERCASE"] = []string{"foo"}
-	ctx := NewIncomingContext(context.Background(), md)
+	ctx = NewIncomingContext(ctx, md)
 
 	for _, test := range []struct {
 		key  string
@@ -338,24 +344,97 @@ func (s) TestAppendToOutgoingContext_FromKVSlice(t *testing.T) {
 	}
 }
 
-func TestStringerMD(t *testing.T) {
+func (s) TestValueFromOutgoingContext(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+
+	md := Pairs(
+		"X-My-Header-1", "42",
+		"x-my-header-3", "44",
+		"k1", "v1",
+		"k2", "v2",
+	)
+	// Verify that we match case-insensitively even if callers directly
+	// modify md.
+	md["X-INCORRECT-UPPERCASE"] = []string{"foo"}
+	ctx = NewOutgoingContext(ctx, md)
+	ctx = AppendToOutgoingContext(ctx, "x-my-header-2", "43-1")
+	ctx = AppendToOutgoingContext(ctx, "X-My-Header-2", "43-2")
+	ctx = AppendToOutgoingContext(ctx, "k1", "v3")
+	ctx = AppendToOutgoingContext(ctx, "k1", "v4")
+
 	for _, test := range []struct {
-		md   MD
-		want string
+		key  string
+		want []string
 	}{
-		{MD{}, "map[]"},
-		{MD{"k1": []string{}}, "map[k1:[]]"},
-		{MD{"k1": []string{"v1", "v2"}}, "map[k1:[v1 v2]]"},
-		{MD{"k1": []string{"v1"}}, "map[k1:[v1]]"},
-		{MD{"k1": []string{"v1", "v2"}, "k2": []string{}, "k3": []string{"1", "2", "3"}}, "map[k1:[v1 v2] k2:[] k3:[1 2 3]]"},
-		{MD{"k2": []string{}, "k3": []string{"1", "2", "3"}, "k1": []string{"v1", "v2"}}, "map[k1:[v1 v2] k2:[] k3:[1 2 3]]"},
-		{MD{"k3": []string{"1", "2", "3"}, "k2": []string{}, "k1": []string{"v1", "v2"}}, "map[k1:[v1 v2] k2:[] k3:[1 2 3]]"},
+		{
+			key:  "x-my-header-1",
+			want: []string{"42"},
+		},
+		{
+			// Split across two AppendToOutgoingContext calls (raw.added) —
+			// must accumulate across both, in call order.
+			key:  "x-my-header-2",
+			want: []string{"43-1", "43-2"},
+		},
+		{
+			key:  "x-my-header-3",
+			want: []string{"44"},
+		},
+		{
+			key:  "x-unknown",
+			want: nil,
+		},
+		{
+			key:  "x-incorrect-uppercase",
+			want: []string{"foo"},
+		},
+		{
+			// Present in both raw.md and two later AppendToOutgoingContext
+			// calls — must accumulate across all three, in order.
+			key:  "k1",
+			want: []string{"v1", "v3", "v4"},
+		},
 	} {
-		got := test.md.String()
-		if got != test.want {
-			t.Fatalf("Metadata string %q should be %q", got, test.want)
+		v := ValueFromOutgoingContext(ctx, test.key)
+		if diff := cmp.Diff(test.want, v); diff != "" {
+			t.Errorf("ValueFromOutgoingContext(ctx, %q) returned unexpected diff (-want +got):\n%s", test.key, diff)
 		}
 	}
+}
+
+func (s) TestValueFromOutgoingContext_NoMetadata(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+
+	if v := ValueFromOutgoingContext(ctx, "x-my-header-1"); v != nil {
+		t.Errorf("ValueFromOutgoingContext on context with no outgoing metadata = %v, want nil", v)
+	}
+}
+
+func (s) TestValueFromOutgoingContext_AddedCaseInsensitive(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	ctx = context.WithValue(ctx, mdOutgoingKey{}, rawMD{added: [][]string{{"X-My-Header", "42"}}})
+
+	v := ValueFromOutgoingContext(ctx, "x-my-header")
+	if diff := cmp.Diff([]string{"42"}, v); diff != "" {
+		t.Errorf("ValueFromOutgoingContext(ctx, \"x-my-header\") returned unexpected diff (-want +got):\n%s", diff)
+	}
+}
+
+func (s) TestValueFromOutgoingContext_PanicsOnOddPairs(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("ValueFromOutgoingContext did not panic on an odd number of pairs in added")
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	ctx = context.WithValue(ctx, mdOutgoingKey{}, rawMD{added: [][]string{{"key-without-a-value"}}})
+
+	ValueFromOutgoingContext(ctx, "key-without-a-value")
 }
 
 // Old/slow approach to adding metadata to context
@@ -395,9 +474,38 @@ func BenchmarkFromOutgoingContext(b *testing.B) {
 	}
 }
 
+// Reading one key out of many staged headers
+func BenchmarkValueFromOutgoingContextVsFromOutgoingContext(b *testing.B) {
+	for _, numHeaders := range []int{1, 10, 50} {
+		ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+		defer cancel()
+		md := MD{}
+		for i := 0; i < numHeaders; i++ {
+			md[strconv.Itoa(i)] = []string{strconv.Itoa(i)}
+		}
+		ctx = NewOutgoingContext(ctx, md)
+		ctx = AppendToOutgoingContext(ctx, "target-key", "target-value")
+
+		b.Run(fmt.Sprintf("FromOutgoingContext/n=%d", numHeaders), func(b *testing.B) {
+			for b.Loop() {
+				FromOutgoingContext(ctx)
+			}
+		})
+
+		b.Run(fmt.Sprintf("ValueFromOutgoingContext/n=%d", numHeaders), func(b *testing.B) {
+			for b.Loop() {
+				ValueFromOutgoingContext(ctx, "target-key")
+			}
+		})
+	}
+}
+
 func BenchmarkFromIncomingContext(b *testing.B) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
 	md := Pairs("X-My-Header-1", "42")
-	ctx := NewIncomingContext(context.Background(), md)
+	ctx = NewIncomingContext(ctx, md)
+
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
 		FromIncomingContext(ctx)
@@ -405,8 +513,10 @@ func BenchmarkFromIncomingContext(b *testing.B) {
 }
 
 func BenchmarkValueFromIncomingContext(b *testing.B) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
 	md := Pairs("X-My-Header-1", "42")
-	ctx := NewIncomingContext(context.Background(), md)
+	ctx = NewIncomingContext(ctx, md)
 
 	b.Run("key-found", func(b *testing.B) {
 		for n := 0; n < b.N; n++ {
@@ -425,4 +535,143 @@ func BenchmarkValueFromIncomingContext(b *testing.B) {
 			}
 		}
 	})
+}
+
+func BenchmarkValueFromOutgoingContext(b *testing.B) {
+	// Realistic-length gRPC metadata keys, not "k1"/"k2"/"k3": short keys
+	// understate the cost of strings.EqualFold relative to a cheap exact
+	// match, which matters for the key-found cases below.
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	ctx = NewOutgoingContext(ctx, MD{"content-type": {"application/grpc"}})
+	ctx = AppendToOutgoingContext(ctx, "grpc-timeout", "10S", "x-request-id", "abc-def-123")
+
+	b.Run("key-found", func(b *testing.B) {
+		for b.Loop() {
+			ValueFromOutgoingContext(ctx, "grpc-timeout")
+		}
+	})
+
+	b.Run("key-not-found", func(b *testing.B) {
+		for b.Loop() {
+			ValueFromOutgoingContext(ctx, "x-does-not-exist")
+		}
+	})
+
+	// Key present in both raw.md ("content-type") and raw.added (appended
+	// below) — exercises the accumulate-across-both path, not just
+	// append-to-nil.
+	bothCtx := AppendToOutgoingContext(ctx, "content-type", "application/grpc+proto")
+	b.Run("key-found-in-md-and-added", func(b *testing.B) {
+		for b.Loop() {
+			ValueFromOutgoingContext(bothCtx, "content-type")
+		}
+	})
+}
+
+// TestString verifies that String shows keys and values only for keys known to
+// be safe to log, omits every other key (including its name) and reports only
+// the count of omitted keys, and never panics on nil/empty inputs.
+func (s) TestString(t *testing.T) {
+	tests := []struct {
+		name string
+		md   MD
+		want string
+	}{
+		{
+			name: "empty",
+			md:   MD{},
+			want: "map[]",
+		},
+		{
+			name: "nil",
+			md:   nil,
+			want: "map[]",
+		},
+		{
+			name: "safe-key-shown",
+			md:   Pairs("content-type", "application/grpc"),
+			want: "map[content-type:[application/grpc]]",
+		},
+		{
+			// A safe key with multiple values shows all of them.
+			name: "safe-key-multi-value",
+			md:   Pairs("grpc-accept-encoding", "gzip", "grpc-accept-encoding", "snappy"),
+			want: "map[grpc-accept-encoding:[gzip snappy]]",
+		},
+		{
+			// nil/empty value slices must not panic; a safe key shows [].
+			name: "safe-key-nil-value",
+			md:   MD{"content-type": nil},
+			want: "map[content-type:[]]",
+		},
+		{
+			// A redacted key with a nil value slice still redacts, no panic.
+			name: "redacted-key-nil-value",
+			md:   MD{"authorization": nil},
+			want: "map[<1 redacted>]",
+		},
+		{
+			// Bracket characters in a safe value are passed through verbatim.
+			name: "safe-value-with-brackets",
+			md:   MD{"content-type": []string{"a]b ["}},
+			want: "map[content-type:[a]b []]",
+		},
+		{
+			// Keys differing only in case are sorted byte-wise (uppercase
+			// first); both still match the case-insensitive safelist.
+			name: "case-only-collision",
+			md:   MD{"Content-Type": []string{"a"}, "content-type": []string{"b"}},
+			want: "map[Content-Type:[a] content-type:[b]]",
+		},
+		{
+			// A sensitive key is omitted entirely, including its name; only the
+			// count is reported.
+			name: "sensitive-key-redacted",
+			md:   Pairs("authorization", "Bearer super-secret-token"),
+			want: "map[<1 redacted>]",
+		},
+		{
+			// Application-defined keys are omitted; the key name (which may
+			// itself be sensitive) is never shown.
+			name: "custom-key-redacted",
+			md:   Pairs("x-my-app-secret", "hunter2"),
+			want: "map[<1 redacted>]",
+		},
+		{
+			// A single key with multiple values counts as one redacted key, and
+			// the value count is not leaked.
+			name: "multi-value-redacted",
+			md:   Pairs("cookie", "a=1", "cookie", "b=2"),
+			want: "map[<1 redacted>]",
+		},
+		{
+			// Multiple redacted keys are reported by count only.
+			name: "multiple-redacted-keys",
+			md:   Pairs("authorization", "tok", "cookie", "x"),
+			want: "map[<2 redacted>]",
+		},
+		{
+			// Safe keys are shown (sorted) and non-safe keys are summarized by a
+			// trailing count.
+			name: "mixed-safe-and-redacted",
+			md:   Pairs("grpc-encoding", "gzip", "authorization", "tok", "user-agent", "grpc-go/x"),
+			want: "map[grpc-encoding:[gzip] user-agent:[grpc-go/x] <1 redacted>]",
+		},
+		{
+			// Keys built via map literal are not canonicalized to lowercase;
+			// the safelist match is case-insensitive so a safe key is still
+			// shown.
+			name: "uppercase-safe-key-shown",
+			md:   MD{"Content-Type": []string{"application/grpc"}},
+			want: "map[Content-Type:[application/grpc]]",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := test.md.String(); got != test.want {
+				t.Errorf("MD.String() = %q, want %q", got, test.want)
+			}
+		})
+	}
 }

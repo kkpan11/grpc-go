@@ -30,6 +30,7 @@ import (
 	"google.golang.org/grpc/internal/stubserver"
 	"google.golang.org/grpc/internal/testutils"
 	"google.golang.org/grpc/internal/testutils/xds/e2e"
+	"google.golang.org/grpc/internal/testutils/xds/e2e/setup"
 	"google.golang.org/grpc/resolver"
 
 	v3corepb "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
@@ -147,7 +148,7 @@ func (s) TestUnmarshalListener_WithUpdateValidatorFunc(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			managementServer, nodeID, bootstrapContents, xdsResolver := setupManagementServerAndResolver(t)
+			managementServer, nodeID, bootstrapContents, xdsResolver := setup.ManagementServerAndResolver(t)
 
 			lis, cleanup2 := setupGRPCServer(t, bootstrapContents)
 			defer cleanup2()
@@ -190,9 +191,9 @@ func (s) TestUnmarshalListener_WithUpdateValidatorFunc(t *testing.T) {
 			}
 
 			// Create a ClientConn with the xds scheme and make an RPC.
-			cc, err := grpc.DialContext(ctx, fmt.Sprintf("xds:///%s", serviceName), grpc.WithTransportCredentials(creds), grpc.WithResolvers(xdsResolver))
+			cc, err := grpc.NewClient(fmt.Sprintf("xds:///%s", serviceName), grpc.WithTransportCredentials(creds), grpc.WithResolvers(xdsResolver))
 			if err != nil {
-				t.Fatalf("failed to dial local test server: %v", err)
+				t.Fatalf("grpc.NewClient() failed: %v", err)
 			}
 			defer cc.Close()
 
@@ -328,13 +329,9 @@ func (s) TestUnmarshalCluster_WithUpdateValidatorFunc(t *testing.T) {
 			bootstrapContents := e2e.DefaultBootstrapContents(t, nodeID, managementServer.Address)
 
 			// Create an xDS resolver with the above bootstrap configuration.
-			var xdsResolver resolver.Builder
-			if newResolver := internal.NewXDSResolverWithConfigForTesting; newResolver != nil {
-				var err error
-				xdsResolver, err = newResolver.(func([]byte) (resolver.Builder, error))(bootstrapContents)
-				if err != nil {
-					t.Fatalf("Failed to create xDS resolver for testing: %v", err)
-				}
+			xdsResolver, err := internal.NewXDSResolverWithConfigForTesting.(func([]byte) (resolver.Builder, error))(bootstrapContents)
+			if err != nil {
+				t.Fatalf("Failed to create xDS resolver for testing: %v", err)
 			}
 
 			server := stubserver.StartTestService(t, nil)
@@ -359,7 +356,7 @@ func (s) TestUnmarshalCluster_WithUpdateValidatorFunc(t *testing.T) {
 
 			cc, err := grpc.NewClient(fmt.Sprintf("xds:///%s", serviceName), grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithResolvers(xdsResolver))
 			if err != nil {
-				t.Fatalf("failed to dial local test server: %v", err)
+				t.Fatalf("grpc.NewClient() failed: %v", err)
 			}
 			defer cc.Close()
 

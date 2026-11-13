@@ -51,12 +51,14 @@ pass () {
 EXAMPLES=(
     "helloworld"
     "route_guide"
+    "features/advancedtls"
     "features/authentication"
     "features/authz"
     "features/cancellation"
     "features/compression"
     "features/customloadbalancer"
     "features/deadline"
+    "features/dualstack"
     "features/encryption/TLS"
     "features/error_details"
     "features/error_handling"
@@ -70,22 +72,26 @@ EXAMPLES=(
     "features/orca"
     "features/retry"
     "features/unix_abstract"
+    "features/gracefulstop"
 )
 
 declare -A SERVER_ARGS=(
     ["features/unix_abstract"]="-addr $UNIX_ADDR"
     ["default"]="-port $SERVER_PORT"
+    ["features/advancedtls"]="-credentials_directory $(dirname $(realpath "$0"))/features/advancedtls/creds"
 )
 
 declare -A CLIENT_ARGS=(
     ["features/unix_abstract"]="-addr $UNIX_ADDR"
     ["features/orca"]="-test=true"
     ["default"]="-addr localhost:$SERVER_PORT"
+    ["features/advancedtls"]="-credentials_directory $(dirname $(realpath "$0"))/features/advancedtls/creds"
 )
 
 declare -A SERVER_WAIT_COMMAND=(
     ["features/unix_abstract"]="lsof -U | grep $UNIX_ADDR"
     ["default"]="lsof -i :$SERVER_PORT | grep $SERVER_PORT"
+    ["features/dualstack"]="lsof -i :50053 | grep 50053"
 )
 
 wait_for_server () {
@@ -112,6 +118,7 @@ declare -A EXPECTED_SERVER_OUTPUT=(
     ["features/compression"]="UnaryEcho called with message \"compress\""
     ["features/customloadbalancer"]="serving on localhost:50051"
     ["features/deadline"]=""
+    ["features/dualstack"]="serving on \[::\]:50051"
     ["features/encryption/TLS"]=""
     ["features/error_details"]=""
     ["features/error_handling"]=""
@@ -125,6 +132,8 @@ declare -A EXPECTED_SERVER_OUTPUT=(
     ["features/orca"]="Server listening"
     ["features/retry"]="request succeeded count: 4"
     ["features/unix_abstract"]="serving on @abstract-unix-socket"
+    ["features/advancedtls"]=""
+    ["features/gracefulstop"]="Server stopped gracefully."
 )
 
 declare -A EXPECTED_CLIENT_OUTPUT=(
@@ -136,6 +145,7 @@ declare -A EXPECTED_CLIENT_OUTPUT=(
     ["features/compression"]="UnaryEcho call returned \"compress\", <nil>"
     ["features/customloadbalancer"]="Successful multiple iterations of 1:2 ratio"
     ["features/deadline"]="wanted = DeadlineExceeded, got = DeadlineExceeded"
+    ["features/dualstack"]="Successful multiple iterations of 1:1:1 ratio"
     ["features/encryption/TLS"]="UnaryEcho:  hello world"
     ["features/error_details"]="Greeting: Hello world"
     ["features/error_handling"]="Received error"
@@ -149,6 +159,8 @@ declare -A EXPECTED_CLIENT_OUTPUT=(
     ["features/orca"]="Per-call load report received: map\[db_queries:10\]"
     ["features/retry"]="UnaryEcho reply: message:\"Try and Success\""
     ["features/unix_abstract"]="calling echo.Echo/UnaryEcho to unix-abstract:abstract-unix-socket"
+    ["features/advancedtls"]=""
+    ["features/gracefulstop"]="Successful unary requests processed by server and made by client are same."
 )
 
 cd ./examples
@@ -188,13 +200,24 @@ for example in ${EXAMPLES[@]}; do
         $(cat $CLIENT_LOG)
         "
     else
-        pass "client successfully communitcated with server"
+        pass "client successfully communicated with server"
     fi
 
     # Check server log for expected output if expecting an
     # output
     if [ -n "${EXPECTED_SERVER_OUTPUT[$example]}" ]; then
-        if ! grep -q "${EXPECTED_SERVER_OUTPUT[$example]}" $SERVER_LOG; then
+        found=false
+
+        # Poll for up to 10 seconds.
+        for i in {1..10}; do
+            if grep -q "${EXPECTED_SERVER_OUTPUT[$example]}" "$SERVER_LOG"; then
+                found=true
+                break
+            fi
+            sleep 1
+        done
+
+        if [ "$found" = "false" ]; then
             fail "server log missing output: ${EXPECTED_SERVER_OUTPUT[$example]}
             got server log:
             $(cat $SERVER_LOG)

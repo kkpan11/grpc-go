@@ -21,6 +21,8 @@ package status_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -35,8 +37,10 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/protoadapt"
+	"google.golang.org/protobuf/testing/protocmp"
 
 	testpb "google.golang.org/grpc/interop/grpc_testing"
+	tpb "google.golang.org/grpc/testdata/grpc_testing_not_regenerated"
 )
 
 const defaultTestTimeout = 10 * time.Second
@@ -173,7 +177,7 @@ func (s) TestStatusDetails(t *testing.T) {
 					// Start a simple server that returns the trailer and error it receives from
 					// channels.
 					ss := &stubserver.StubServer{
-						UnaryCallF: func(ctx context.Context, in *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+						UnaryCallF: func(ctx context.Context, _ *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
 							grpc.SetTrailer(ctx, tc.trailerSent)
 							return nil, tc.errSent
 						},
@@ -199,6 +203,114 @@ func (s) TestStatusDetails(t *testing.T) {
 						t.Errorf("Err got: %v; want: (Contains: %v)", errGot, tc.errWant)
 					}
 				})
+			}
+		})
+	}
+}
+
+// TestStatus_ErrorDetailsMessageV1 verifies backward compatibility of the
+// status.Details() method when using protobuf code generated with only the
+// MessageV1 API implementation.
+func (s) TestStatus_ErrorDetailsMessageV1(t *testing.T) {
+	details := []protoadapt.MessageV1{
+		&tpb.SimpleMessage{Data: "abc"},
+	}
+	s, err := status.New(codes.Aborted, "").WithDetails(details...)
+	if err != nil {
+		t.Fatalf("(%v).WithDetails(%+v) failed: %v", s, details, err)
+	}
+	gotDetails := s.Details()
+	for i, msg := range gotDetails {
+		if got, want := reflect.TypeOf(msg), reflect.TypeOf(details[i]); got != want {
+			t.Errorf("reflect.Typeof(%v) = %v, want = %v", msg, got, want)
+		}
+		if _, ok := msg.(protoadapt.MessageV1); !ok {
+			t.Errorf("(%v).Details() returned message that doesn't implement protoadapt.MessageV1: %v", s, msg)
+		}
+		if diff := cmp.Diff(msg, details[i], protocmp.Transform()); diff != "" {
+			t.Errorf("(%v).Details got unexpected output, diff (-got +want):\n%s", s, diff)
+		}
+	}
+}
+
+// TestStatus_ErrorDetailsMessageV1AndV2 verifies that status.Details() method
+// returns the same message types when using protobuf code generated with both the
+// MessageV1 and MessageV2 API implementations.
+func (s) TestStatus_ErrorDetailsMessageV1AndV2(t *testing.T) {
+	details := []protoadapt.MessageV1{
+		&testpb.Empty{},
+	}
+	s, err := status.New(codes.Aborted, "").WithDetails(details...)
+	if err != nil {
+		t.Fatalf("(%v).WithDetails(%+v) failed: %v", s, details, err)
+	}
+	gotDetails := s.Details()
+	for i, msg := range gotDetails {
+		if got, want := reflect.TypeOf(msg), reflect.TypeOf(details[i]); got != want {
+			t.Errorf("reflect.Typeof(%v) = %v, want = %v", msg, got, want)
+		}
+		if _, ok := msg.(protoadapt.MessageV1); !ok {
+			t.Errorf("(%v).Details() returned message that doesn't implement protoadapt.MessageV1: %v", s, msg)
+		}
+		if _, ok := msg.(protoadapt.MessageV2); !ok {
+			t.Errorf("(%v).Details() returned message that doesn't implement protoadapt.MessageV2: %v", s, msg)
+		}
+		if diff := cmp.Diff(msg, details[i], protocmp.Transform()); diff != "" {
+			t.Errorf("(%v).Details got unexpected output, diff (-got +want):\n%s", s, diff)
+		}
+	}
+}
+
+func (s) TestFromError_Wrapped(t *testing.T) {
+	base := status.New(codes.Canceled, "inner canceled")
+	sWithDetails, err := base.WithDetails(&testpb.Empty{})
+	if err != nil {
+		t.Fatalf("WithDetails failed: %v", err)
+	}
+	innerErr := sWithDetails.Err()
+	mustStatus := func(message string) *status.Status {
+		st, err := status.New(codes.Canceled, message).WithDetails(&testpb.Empty{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return st
+	}
+
+	testCases := []struct {
+		name       string
+		err        error
+		wantStatus *status.Status
+	}{
+		{
+			name:       "direct_error",
+			err:        innerErr,
+			wantStatus: mustStatus("inner canceled"),
+		},
+		{
+			name:       "wrapped_error",
+			err:        fmt.Errorf("wrapped: %w", innerErr),
+			wantStatus: mustStatus("wrapped: rpc error: code = Canceled desc = inner canceled"),
+		},
+		{
+			name:       "double_wrapped_error",
+			err:        fmt.Errorf("outer: %w", fmt.Errorf("inner: %w", innerErr)),
+			wantStatus: mustStatus("outer: inner: rpc error: code = Canceled desc = inner canceled"),
+		},
+		{
+			name:       "double_wrapped_single_errorf",
+			err:        fmt.Errorf("error: %w: %w", errors.New("test error"), innerErr),
+			wantStatus: mustStatus("error: test error: rpc error: code = Canceled desc = inner canceled"),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := status.FromError(tc.err)
+			if !ok {
+				t.Fatalf("status.FromError(%v) returned false; want true", tc.err)
+			}
+			if diff := cmp.Diff(tc.wantStatus, got, protocmp.Transform(), cmp.AllowUnexported(status.Status{})); diff != "" {
+				t.Fatalf("status.FromError(%v) got unexpected output, diff (-want +got):\n%s", tc.err, diff)
 			}
 		})
 	}

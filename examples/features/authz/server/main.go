@@ -16,7 +16,8 @@
  *
  */
 
-// Binary server is an example server.
+// Binary server demonstrates how to validate authorization credential metadata
+// for incoming RPCs.
 package main
 
 import (
@@ -101,7 +102,7 @@ type server struct {
 	pb.UnimplementedEchoServer
 }
 
-func (s *server) UnaryEcho(ctx context.Context, in *pb.EchoRequest) (*pb.EchoResponse, error) {
+func (s *server) UnaryEcho(_ context.Context, in *pb.EchoRequest) (*pb.EchoResponse, error) {
 	fmt.Printf("unary echoing message %q\n", in.Message)
 	return &pb.EchoResponse{Message: in.Message}, nil
 }
@@ -144,7 +145,7 @@ func isAuthenticated(authorization []string) (username string, err error) {
 // authUnaryInterceptor looks up the authorization header from the incoming RPC context,
 // retrieves the username from it and creates a new context with the username before invoking
 // the provided handler.
-func authUnaryInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+func authUnaryInterceptor(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
 		return nil, errMissingMetadata
@@ -175,7 +176,7 @@ func newWrappedStream(ctx context.Context, s grpc.ServerStream) grpc.ServerStrea
 // authStreamInterceptor looks up the authorization header from the incoming RPC context,
 // retrieves the username from it and creates a new context with the username before invoking
 // the provided handler.
-func authStreamInterceptor(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+func authStreamInterceptor(srv any, ss grpc.ServerStream, _ *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 	md, ok := metadata.FromIncomingContext(ss.Context())
 	if !ok {
 		return errMissingMetadata
@@ -196,7 +197,7 @@ func main() {
 
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", *port))
 	if err != nil {
-		log.Fatalf("Listening on local port %q: %v", *port, err)
+		log.Fatalf("Listening on local port %d: %v", *port, err)
 	}
 
 	// Create tls based credential.

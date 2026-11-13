@@ -120,12 +120,12 @@ func NewUnresponsiveTestConn() net.Conn {
 }
 
 // Read reads from the in buffer.
-func (c *unresponsiveTestConn) Read(b []byte) (n int, err error) {
+func (c *unresponsiveTestConn) Read([]byte) (n int, err error) {
 	return 0, io.EOF
 }
 
 // Write writes to the out buffer.
-func (c *unresponsiveTestConn) Write(b []byte) (n int, err error) {
+func (c *unresponsiveTestConn) Write([]byte) (n int, err error) {
 	return 0, nil
 }
 
@@ -145,6 +145,8 @@ func MakeFrame(pl string) []byte {
 // FakeHandshaker is a fake implementation of the ALTS handshaker service.
 type FakeHandshaker struct {
 	altsgrpc.HandshakerServiceServer
+	// ExpectedBoundAccessToken is the expected bound access token in the ClientStart request.
+	ExpectedBoundAccessToken string
 }
 
 // DoHandshake performs a fake ALTS handshake.
@@ -220,6 +222,9 @@ func (h *FakeHandshaker) processStartClient(req *altspb.StartClientHandshakeReq)
 	}
 	if len(req.RecordProtocols) != 1 || req.RecordProtocols[0] != "ALTSRP_GCM_AES128_REKEY" {
 		return nil, fmt.Errorf("unexpected record protocols: %v", req.RecordProtocols)
+	}
+	if h.ExpectedBoundAccessToken != req.GetAccessToken() {
+		return nil, fmt.Errorf("unexpected access token: %v", req.GetAccessToken())
 	}
 	return &altspb.HandshakerResp{
 		OutFrames:     []byte("ClientInit"),

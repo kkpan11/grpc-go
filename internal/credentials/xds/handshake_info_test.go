@@ -19,16 +19,42 @@
 package xds
 
 import (
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
 	"crypto/x509"
+	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
+	"os"
 	"regexp"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"google.golang.org/grpc/testdata"
+
+	"google.golang.org/grpc/credentials/tls/certprovider"
+	"google.golang.org/grpc/internal/credentials/spiffe"
+	"google.golang.org/grpc/internal/envconfig"
+	"google.golang.org/grpc/internal/grpcsync"
+	"google.golang.org/grpc/internal/grpctest"
+	"google.golang.org/grpc/internal/testutils"
 	"google.golang.org/grpc/internal/xds/matcher"
 )
 
-func TestDNSMatch(t *testing.T) {
+type s struct {
+	grpctest.Tester
+}
+
+func Test(t *testing.T) {
+	grpctest.RunSubTests(t, s{})
+}
+
+func (s) TestDNSMatch(t *testing.T) {
 	tests := []struct {
 		desc      string
 		host      string
@@ -125,7 +151,7 @@ func TestDNSMatch(t *testing.T) {
 	}
 }
 
-func TestMatchingSANExists_FailureCases(t *testing.T) {
+func (s) TestMatchingSANExists_FailureCases(t *testing.T) {
 	url1, err := url.Parse("http://golang.org")
 	if err != nil {
 		t.Fatalf("url.Parse() failed: %v", err)
@@ -137,8 +163,11 @@ func TestMatchingSANExists_FailureCases(t *testing.T) {
 	inputCert := &x509.Certificate{
 		DNSNames:       []string{"foo.bar.example.com", "bar.baz.test.com", "*.example.com"},
 		EmailAddresses: []string{"foobar@example.com", "barbaz@test.com"},
-		IPAddresses:    []net.IP{net.ParseIP("192.0.0.1"), net.ParseIP("2001:db8::68")},
-		URIs:           []*url.URL{url1, url2},
+		IPAddresses: []net.IP{
+			netip.MustParseAddr("192.0.0.1").AsSlice(),
+			netip.MustParseAddr("2001:db8::68").AsSlice(),
+		},
+		URIs: []*url.URL{url1, url2},
 	}
 
 	tests := []struct {
@@ -148,56 +177,57 @@ func TestMatchingSANExists_FailureCases(t *testing.T) {
 		{
 			desc: "exact match",
 			sanMatchers: []matcher.StringMatcher{
-				matcher.StringMatcherForTesting(newStringP("abcd.test.com"), nil, nil, nil, nil, false),
-				matcher.StringMatcherForTesting(newStringP("http://golang"), nil, nil, nil, nil, false),
-				matcher.StringMatcherForTesting(newStringP("HTTP://GOLANG.ORG"), nil, nil, nil, nil, false),
+				matcher.NewExactStringMatcher("abcd.test.com", false),
+				matcher.NewExactStringMatcher("http://golang", false),
+				matcher.NewExactStringMatcher("HTTP://GOLANG.ORG", false),
 			},
 		},
 		{
 			desc: "prefix match",
 			sanMatchers: []matcher.StringMatcher{
-				matcher.StringMatcherForTesting(nil, newStringP("i-aint-the-one"), nil, nil, nil, false),
-				matcher.StringMatcherForTesting(nil, newStringP("192.168.1.1"), nil, nil, nil, false),
-				matcher.StringMatcherForTesting(nil, newStringP("FOO.BAR"), nil, nil, nil, false),
+				matcher.NewPrefixStringMatcher("i-aint-the-one", false),
+				matcher.NewPrefixStringMatcher("192.168.1.1", false),
+				matcher.NewPrefixStringMatcher("FOO.BAR", false),
 			},
 		},
 		{
 			desc: "suffix match",
 			sanMatchers: []matcher.StringMatcher{
-				matcher.StringMatcherForTesting(nil, nil, newStringP("i-aint-the-one"), nil, nil, false),
-				matcher.StringMatcherForTesting(nil, nil, newStringP("1::68"), nil, nil, false),
-				matcher.StringMatcherForTesting(nil, nil, newStringP(".COM"), nil, nil, false),
+				matcher.NewSuffixStringMatcher("i-aint-the-one", false),
+				matcher.NewSuffixStringMatcher("1::68", false),
+				matcher.NewSuffixStringMatcher(".COM", false),
 			},
 		},
 		{
 			desc: "regex match",
 			sanMatchers: []matcher.StringMatcher{
-				matcher.StringMatcherForTesting(nil, nil, nil, nil, regexp.MustCompile(`.*\.examples\.com`), false),
-				matcher.StringMatcherForTesting(nil, nil, nil, nil, regexp.MustCompile(`192\.[0-9]{1,3}\.1\.1`), false),
+				matcher.NewRegexStringMatcher(regexp.MustCompile(`.*\.examples\.com`)),
+				matcher.NewRegexStringMatcher(regexp.MustCompile(`192\.[0-9]{1,3}\.1\.1`)),
 			},
 		},
 		{
 			desc: "contains match",
 			sanMatchers: []matcher.StringMatcher{
-				matcher.StringMatcherForTesting(nil, nil, nil, newStringP("i-aint-the-one"), nil, false),
-				matcher.StringMatcherForTesting(nil, nil, nil, newStringP("2001:db8:1:1::68"), nil, false),
-				matcher.StringMatcherForTesting(nil, nil, nil, newStringP("GRPC"), nil, false),
+				matcher.NewContainsStringMatcher("i-aint-the-one", false),
+				matcher.NewContainsStringMatcher("2001:db8:1:1::68", false),
+				matcher.NewContainsStringMatcher("GRPC", false),
 			},
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.desc, func(t *testing.T) {
-			hi := NewHandshakeInfo(nil, nil, test.sanMatchers, false)
+			hi := NewHandshakeInfo(nil, nil, test.sanMatchers, "", false, false, false)
+			defer hi.Decrement()
 
-			if hi.MatchingSANExists(inputCert) {
+			if hi.Value().MatchingSANExists(inputCert) {
 				t.Fatalf("hi.MatchingSANExists(%+v) with SAN matchers +%v succeeded when expected to fail", inputCert, test.sanMatchers)
 			}
 		})
 	}
 }
 
-func TestMatchingSANExists_Success(t *testing.T) {
+func (s) TestMatchingSANExists_Success(t *testing.T) {
 	url1, err := url.Parse("http://golang.org")
 	if err != nil {
 		t.Fatalf("url.Parse() failed: %v", err)
@@ -209,8 +239,11 @@ func TestMatchingSANExists_Success(t *testing.T) {
 	inputCert := &x509.Certificate{
 		DNSNames:       []string{"baz.test.com", "*.example.com"},
 		EmailAddresses: []string{"foobar@example.com", "barbaz@test.com"},
-		IPAddresses:    []net.IP{net.ParseIP("192.0.0.1"), net.ParseIP("2001:db8::68")},
-		URIs:           []*url.URL{url1, url2},
+		IPAddresses: []net.IP{
+			netip.MustParseAddr("192.0.0.1").AsSlice(),
+			netip.MustParseAddr("2001:db8::68").AsSlice(),
+		},
+		URIs: []*url.URL{url1, url2},
 	}
 
 	tests := []struct {
@@ -223,80 +256,413 @@ func TestMatchingSANExists_Success(t *testing.T) {
 		{
 			desc: "exact match dns wildcard",
 			sanMatchers: []matcher.StringMatcher{
-				matcher.StringMatcherForTesting(nil, newStringP("192.168.1.1"), nil, nil, nil, false),
-				matcher.StringMatcherForTesting(newStringP("https://github.com/grpc/grpc-java"), nil, nil, nil, nil, false),
-				matcher.StringMatcherForTesting(newStringP("abc.example.com"), nil, nil, nil, nil, false),
+				matcher.NewPrefixStringMatcher("192.168.1.1", false),
+				matcher.NewExactStringMatcher("https://github.com/grpc/grpc-java", false),
+				matcher.NewExactStringMatcher("abc.example.com", false),
 			},
 		},
 		{
 			desc: "exact match ignore case",
 			sanMatchers: []matcher.StringMatcher{
-				matcher.StringMatcherForTesting(newStringP("FOOBAR@EXAMPLE.COM"), nil, nil, nil, nil, true),
+				matcher.NewExactStringMatcher("FOOBAR@EXAMPLE.COM", true),
 			},
 		},
 		{
 			desc: "prefix match",
 			sanMatchers: []matcher.StringMatcher{
-				matcher.StringMatcherForTesting(nil, nil, newStringP(".co.in"), nil, nil, false),
-				matcher.StringMatcherForTesting(nil, newStringP("192.168.1.1"), nil, nil, nil, false),
-				matcher.StringMatcherForTesting(nil, newStringP("baz.test"), nil, nil, nil, false),
+				matcher.NewSuffixStringMatcher(".co.in", false),
+				matcher.NewPrefixStringMatcher("192.168.1.1", false),
+				matcher.NewPrefixStringMatcher("baz.test", false),
 			},
 		},
 		{
 			desc: "prefix match ignore case",
 			sanMatchers: []matcher.StringMatcher{
-				matcher.StringMatcherForTesting(nil, newStringP("BAZ.test"), nil, nil, nil, true),
+				matcher.NewPrefixStringMatcher("BAZ.test", true),
 			},
 		},
 		{
 			desc: "suffix  match",
 			sanMatchers: []matcher.StringMatcher{
-				matcher.StringMatcherForTesting(nil, nil, nil, nil, regexp.MustCompile(`192\.[0-9]{1,3}\.1\.1`), false),
-				matcher.StringMatcherForTesting(nil, nil, newStringP("192.168.1.1"), nil, nil, false),
-				matcher.StringMatcherForTesting(nil, nil, newStringP("@test.com"), nil, nil, false),
+				matcher.NewRegexStringMatcher(regexp.MustCompile(`192\.[0-9]{1,3}\.1\.1`)),
+				matcher.NewSuffixStringMatcher("192.168.1.1", false),
+				matcher.NewSuffixStringMatcher("@test.com", false),
 			},
 		},
 		{
 			desc: "suffix  match ignore case",
 			sanMatchers: []matcher.StringMatcher{
-				matcher.StringMatcherForTesting(nil, nil, newStringP("@test.COM"), nil, nil, true),
+				matcher.NewSuffixStringMatcher("@test.COM", true),
 			},
 		},
 		{
 			desc: "regex match",
 			sanMatchers: []matcher.StringMatcher{
-				matcher.StringMatcherForTesting(nil, nil, nil, newStringP("https://github.com/grpc/grpc-java"), nil, false),
-				matcher.StringMatcherForTesting(nil, nil, nil, nil, regexp.MustCompile(`192\.[0-9]{1,3}\.1\.1`), false),
-				matcher.StringMatcherForTesting(nil, nil, nil, nil, regexp.MustCompile(`.*\.test\.com`), false),
+				matcher.NewContainsStringMatcher("https://github.com/grpc/grpc-java", false),
+				matcher.NewRegexStringMatcher(regexp.MustCompile(`192\.[0-9]{1,3}\.1\.1`)),
+				matcher.NewRegexStringMatcher(regexp.MustCompile(`.*\.test\.com`)),
 			},
 		},
 		{
 			desc: "contains match",
 			sanMatchers: []matcher.StringMatcher{
-				matcher.StringMatcherForTesting(newStringP("https://github.com/grpc/grpc-java"), nil, nil, nil, nil, false),
-				matcher.StringMatcherForTesting(nil, nil, nil, newStringP("2001:68::db8"), nil, false),
-				matcher.StringMatcherForTesting(nil, nil, nil, newStringP("192.0.0"), nil, false),
+				matcher.NewExactStringMatcher("https://github.com/grpc/grpc-java", false),
+				matcher.NewContainsStringMatcher("2001:68::db8", false),
+				matcher.NewContainsStringMatcher("192.0.0", false),
 			},
 		},
 		{
 			desc: "contains match ignore case",
 			sanMatchers: []matcher.StringMatcher{
-				matcher.StringMatcherForTesting(nil, nil, nil, newStringP("GRPC"), nil, true),
+				matcher.NewContainsStringMatcher("GRPC", true),
 			},
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.desc, func(t *testing.T) {
-			hi := NewHandshakeInfo(nil, nil, test.sanMatchers, false)
+			hi := NewHandshakeInfo(nil, nil, test.sanMatchers, "", false, false, false)
+			defer hi.Decrement()
 
-			if !hi.MatchingSANExists(inputCert) {
+			if !hi.Value().MatchingSANExists(inputCert) {
 				t.Fatalf("hi.MatchingSANExists(%+v) with SAN matchers +%v failed when expected to succeed", inputCert, test.sanMatchers)
 			}
 		})
 	}
 }
 
-func newStringP(s string) *string {
-	return &s
+// Equal reports whether the handshake info structs are identical.
+func (hi *HandshakeInfo) Equal(other *HandshakeInfo) bool {
+	if hi == nil && other == nil {
+		return true
+	}
+	if hi == nil || other == nil {
+		return false
+	}
+
+	r1, i1 := hi.rootProvider, hi.identityProvider
+	r2, i2 := other.rootProvider, other.identityProvider
+
+	switch {
+	case r1 != r2 || i1 != i2:
+		return false
+	case hi.requireClientCert != other.requireClientCert:
+		return false
+	case hi.sni != other.sni:
+		return false
+	case hi.validateSANUsingSNI != other.validateSANUsingSNI:
+		return false
+	case hi.useAutoHostSNI != other.useAutoHostSNI:
+		return false
+	case len(hi.sanMatchers) != len(other.sanMatchers):
+		return false
+	}
+	for i := range hi.sanMatchers {
+		if !hi.sanMatchers[i].Equal(other.sanMatchers[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+type testCertProvider struct {
+	certprovider.Provider
+}
+
+func (s) TestEqual(t *testing.T) {
+	tests := []struct {
+		desc      string
+		hi1       *grpcsync.RefCounted[*HandshakeInfo]
+		hi2       *grpcsync.RefCounted[*HandshakeInfo]
+		wantMatch bool
+	}{
+		{
+			desc: "both HandshakeInfo are nil",
+			hi1: func() *grpcsync.RefCounted[*HandshakeInfo] {
+				return grpcsync.NewRefCounted((*HandshakeInfo)(nil), func() {})
+			}(),
+			hi2: func() *grpcsync.RefCounted[*HandshakeInfo] {
+				return grpcsync.NewRefCounted((*HandshakeInfo)(nil), func() {})
+			}(),
+			wantMatch: true,
+		},
+		{
+			desc: "one HandshakeInfo is nil",
+			hi1: func() *grpcsync.RefCounted[*HandshakeInfo] {
+				return grpcsync.NewRefCounted((*HandshakeInfo)(nil), func() {})
+			}(),
+			hi2:       NewHandshakeInfo(&testCertProvider{}, nil, nil, "", false, false, false),
+			wantMatch: false,
+		},
+		{
+			desc:      "different root providers",
+			hi1:       NewHandshakeInfo(&testCertProvider{}, nil, nil, "", false, false, false),
+			hi2:       NewHandshakeInfo(&testCertProvider{}, nil, nil, "", false, false, false),
+			wantMatch: false,
+		},
+		{
+			desc: "same providers, same SAN matchers",
+			hi1: NewHandshakeInfo(testCertProvider{}, testCertProvider{}, []matcher.StringMatcher{
+				matcher.NewExactStringMatcher("foo.com", false),
+			}, "", false, false, false),
+			hi2: NewHandshakeInfo(testCertProvider{}, testCertProvider{}, []matcher.StringMatcher{
+				matcher.NewExactStringMatcher("foo.com", false),
+			}, "", false, false, false),
+			wantMatch: true,
+		},
+		{
+			desc: "same providers, different SAN matchers",
+			hi1: NewHandshakeInfo(testCertProvider{}, testCertProvider{}, []matcher.StringMatcher{
+				matcher.NewExactStringMatcher("foo.com", false),
+			}, "", false, false, false),
+			hi2: NewHandshakeInfo(testCertProvider{}, testCertProvider{}, []matcher.StringMatcher{
+				matcher.NewExactStringMatcher("bar.com", false),
+			}, "", false, false, false),
+			wantMatch: false,
+		},
+		{
+			desc: "same SAN matchers with different content",
+			hi1: NewHandshakeInfo(testCertProvider{}, testCertProvider{}, []matcher.StringMatcher{
+				matcher.NewExactStringMatcher("foo.com", false),
+			}, "", false, false, false),
+			hi2: NewHandshakeInfo(testCertProvider{}, testCertProvider{}, []matcher.StringMatcher{
+				matcher.NewExactStringMatcher("foo.com", false),
+				matcher.NewExactStringMatcher("bar.com", false),
+			}, "", false, false, false),
+			wantMatch: false,
+		},
+		{
+			desc:      "different requireClientCert flags",
+			hi1:       NewHandshakeInfo(testCertProvider{}, testCertProvider{}, nil, "", true, false, false),
+			hi2:       NewHandshakeInfo(testCertProvider{}, testCertProvider{}, nil, "", false, false, false),
+			wantMatch: false,
+		},
+		{
+			desc:      "same identity provider, different root provider",
+			hi1:       NewHandshakeInfo(&testCertProvider{}, testCertProvider{}, nil, "", false, false, false),
+			hi2:       NewHandshakeInfo(&testCertProvider{}, testCertProvider{}, nil, "", false, false, false),
+			wantMatch: false,
+		},
+		{
+			desc:      "different identity provider, same root provider",
+			hi1:       NewHandshakeInfo(testCertProvider{}, &testCertProvider{}, nil, "", false, false, false),
+			hi2:       NewHandshakeInfo(testCertProvider{}, &testCertProvider{}, nil, "", false, false, false),
+			wantMatch: false,
+		},
+		{
+			desc:      "same sni and validateSANUsingSNI",
+			hi1:       NewHandshakeInfo(nil, nil, nil, "sni", false, true, false),
+			hi2:       NewHandshakeInfo(nil, nil, nil, "sni", false, true, false),
+			wantMatch: true,
+		},
+		{
+			desc:      "different sni",
+			hi1:       NewHandshakeInfo(nil, nil, nil, "sni1", false, false, false),
+			hi2:       NewHandshakeInfo(nil, nil, nil, "sni2", false, false, false),
+			wantMatch: false,
+		},
+		{
+			desc:      "same sni, different validateSANUsingSNI",
+			hi1:       NewHandshakeInfo(nil, nil, nil, "sni", false, false, false),
+			hi2:       NewHandshakeInfo(nil, nil, nil, "sni", false, true, false),
+			wantMatch: false,
+		},
+		{
+			desc:      "different autoHostSNI",
+			hi1:       NewHandshakeInfo(nil, nil, nil, "", false, false, true),
+			hi2:       NewHandshakeInfo(nil, nil, nil, "", false, false, false),
+			wantMatch: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			if gotMatch := test.hi1.Value().Equal(test.hi2.Value()); gotMatch != test.wantMatch {
+				t.Errorf("hi1.Equal(hi2) = %v; wantMatch %v", gotMatch, test.wantMatch)
+			}
+		})
+	}
+}
+
+type testCertProviderWithKeyMaterial struct{}
+
+func (p *testCertProviderWithKeyMaterial) KeyMaterial(_ context.Context) (*certprovider.KeyMaterial, error) {
+	km := &certprovider.KeyMaterial{}
+	spiffeBundleMapContents, err := os.ReadFile(testdata.Path("spiffe_end2end/client_spiffebundle.json"))
+	if err != nil {
+		return nil, err
+	}
+	bundleMap, err := spiffe.BundleMapFromBytes(spiffeBundleMapContents)
+	if err != nil {
+		return nil, err
+	}
+	km.SPIFFEBundleMap = bundleMap
+	rootFileContents, err := os.ReadFile(testdata.Path("spiffe_end2end/ca.pem"))
+	if err != nil {
+		return nil, err
+	}
+	trustPool := x509.NewCertPool()
+	if !trustPool.AppendCertsFromPEM(rootFileContents) {
+		return nil, fmt.Errorf("Failed to parse root certificate")
+	}
+	km.Roots = trustPool
+
+	certFileContents, err := os.ReadFile(testdata.Path("spiffe_end2end/client_spiffe.pem"))
+	if err != nil {
+		return nil, err
+	}
+	keyFileContents, err := os.ReadFile(testdata.Path("spiffe_end2end/client.key"))
+	if err != nil {
+		return nil, err
+	}
+	cert, err := tls.X509KeyPair(certFileContents, keyFileContents)
+	if err != nil {
+		return nil, err
+	}
+	km.Certs = []tls.Certificate{cert}
+	return km, nil
+}
+
+func (p *testCertProviderWithKeyMaterial) Close() {}
+
+func (s) TestBuildVerifyFuncFailures(t *testing.T) {
+	tests := []struct {
+		desc          string
+		peerCertChain [][]byte
+		wantErr       string
+	}{
+		{
+			desc:          "invalid x509",
+			peerCertChain: [][]byte{[]byte("NOT_A_CERT")},
+			wantErr:       "x509: malformed certificate",
+		},
+		{
+			desc: "invalid SPIFFE ID in peer cert",
+			// server1.pem doesn't have a valid SPIFFE ID, so attempted to get a
+			// root from the SPIFFE Bundle Map will fail
+			peerCertChain: loadCert(t, testdata.Path("server1.pem"), testdata.Path("server1.key")),
+			wantErr:       "spiffe: could not get spiffe ID from peer leaf cert but verification with spiffe trust map was configure",
+		},
+	}
+	testProvider := testCertProviderWithKeyMaterial{}
+	hi := NewHandshakeInfo(&testProvider, &testProvider, nil, "", true, false, false)
+	defer hi.Decrement()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	hiPtr := new(atomic.Pointer[grpcsync.RefCounted[*HandshakeInfo]])
+	hiPtr.Store(hi)
+	cfg, _, done, err := ClientSideTLSConfig(ctx, hiPtr, "")
+	if err != nil {
+		t.Fatalf("GetClientSideTLSConfig() failed with err %v", err)
+	}
+	defer done()
+	for _, tc := range tests {
+		t.Run(tc.desc, func(t *testing.T) {
+			err = cfg.VerifyPeerCertificate(tc.peerCertChain, nil)
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("VerifyPeerCertificate got err %v, want: %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func loadCert(t *testing.T, certPath, keyPath string) [][]byte {
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		t.Fatalf("LoadX509KeyPair(%s, %s) failed: %v", certPath, keyPath, err)
+	}
+	return cert.Certificate
+
+}
+
+type testProviderWithRoots struct {
+	roots *x509.CertPool
+}
+
+func (m *testProviderWithRoots) KeyMaterial(context.Context) (*certprovider.KeyMaterial, error) {
+	return &certprovider.KeyMaterial{
+		Roots: m.roots,
+	}, nil
+}
+
+func (m *testProviderWithRoots) Close() {}
+
+// Tests the scenario where the SNI provided by the xDS server is only present
+// in the URI SAN of the certificate presented by the server, and not in the DNS
+// SAN. It verifies that if the SNI-based SAN validation is turned on, the TLS
+// handshake fails due to SNI mismatch.
+func (s) TestAutoHostSNI_DNS_SANValidation_Failures(t *testing.T) {
+	testutils.SetEnvConfig(t, &envconfig.XDSSNIEnabled, true)
+
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("rsa.GenerateKey() failed: %v", err)
+	}
+
+	testURL, err := url.Parse("http://wrong.sni.domain")
+	if err != nil {
+		t.Fatalf("url.Parse() failed: %v", err)
+	}
+
+	template := &x509.Certificate{
+		NotBefore: time.Now(),
+		NotAfter:  time.Now().Add(time.Hour),
+		DNSNames:  []string{"unrelated.example.com"},
+		URIs:      []*url.URL{testURL}, // URI matching SNI
+	}
+
+	derBytes, err := x509.CreateCertificate(rand.Reader, template, template, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatalf("x509.CreateCertificate() failed: %v", err)
+	}
+
+	cert, err := x509.ParseCertificate(derBytes)
+	if err != nil {
+		t.Fatalf("x509.ParseCertificate() failed: %v", err)
+	}
+
+	roots := x509.NewCertPool()
+	roots.AddCert(cert)
+
+	provider := &testProviderWithRoots{roots: roots}
+	hi := NewHandshakeInfo(provider, nil, nil, "wrong.sni.domain", true, true, false)
+	defer hi.Decrement()
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	hiPtr := new(atomic.Pointer[grpcsync.RefCounted[*HandshakeInfo]])
+	hiPtr.Store(hi)
+	cfg, _, done, err := ClientSideTLSConfig(ctx, hiPtr, "")
+	if err != nil {
+		t.Fatalf("GetClientSideTLSConfig() failed: %v", err)
+	}
+	defer done()
+
+	err = cfg.VerifyPeerCertificate([][]byte{derBytes}, nil)
+	if err == nil {
+		t.Fatalf("VerifyPeerCertificate() unexpectedly succeeded when SNI was only in URI SAN")
+	}
+	if !strings.Contains(err.Error(), "received DNS SANs: [unrelated.example.com] do not match the SNI: wrong.sni.domain") {
+		t.Fatalf("VerifyPeerCertificate() failed with %v, want error containing 'do not match the SNI'", err)
+	}
+}
+
+func (s) TestVerifyPeerCertificateZeroCerts(t *testing.T) {
+	provider := &testProviderWithRoots{roots: x509.NewCertPool()}
+	hi := NewHandshakeInfo(provider, nil, nil, "", true, false, false)
+	defer hi.Decrement()
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	hiPtr := new(atomic.Pointer[grpcsync.RefCounted[*HandshakeInfo]])
+	hiPtr.Store(hi)
+	cfg, _, done, err := ClientSideTLSConfig(ctx, hiPtr, "")
+	if err != nil {
+		t.Fatalf("GetClientSideTLSConfig() failed: %v", err)
+	}
+	defer done()
+
+	const wantErr = "no peer certificates presented"
+	if err := cfg.VerifyPeerCertificate(nil, nil); err == nil || !strings.Contains(err.Error(), wantErr) {
+		t.Errorf("VerifyPeerCertificate(nil, nil) = %v, want error containing %q", err, wantErr)
+	}
 }

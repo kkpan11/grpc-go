@@ -33,7 +33,9 @@ import (
 
 	epb "google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/protoadapt"
@@ -137,7 +139,7 @@ func (s) TestHandlerTransport_NewServerHandlerTransport(t *testing.T) {
 					Path: "/service/foo.bar",
 				},
 			},
-			check: func(t *serverHandlerTransport, tt *testCase) error {
+			check: func(t *serverHandlerTransport, _ *testCase) error {
 				if !t.timeoutSet {
 					return errors.New("timeout not set")
 				}
@@ -178,7 +180,7 @@ func (s) TestHandlerTransport_NewServerHandlerTransport(t *testing.T) {
 					Path: "/service/foo.bar",
 				},
 			},
-			check: func(ht *serverHandlerTransport, tt *testCase) error {
+			check: func(ht *serverHandlerTransport, _ *testCase) error {
 				want := metadata.MD{
 					"meta-bar":     {"bar-val1", "bar-val2"},
 					"user-agent":   {"x/y a/b"},
@@ -203,7 +205,7 @@ func (s) TestHandlerTransport_NewServerHandlerTransport(t *testing.T) {
 		if tt.modrw != nil {
 			rw = tt.modrw(rw)
 		}
-		got, gotErr := NewServerHandlerTransport(rw, tt.req, nil)
+		got, gotErr := NewServerHandlerTransport(rw, tt.req, nil, mem.DefaultBufferPool())
 		if (gotErr != nil) != (tt.wantErr != "") || (gotErr != nil && gotErr.Error() != tt.wantErr) {
 			t.Errorf("%s: error = %q; want %q", tt.name, gotErr.Error(), tt.wantErr)
 			continue
@@ -245,7 +247,26 @@ type handleStreamTest struct {
 	ht    *serverHandlerTransport
 }
 
-func newHandleStreamTest(t *testing.T) *handleStreamTest {
+type mockStatsHandler struct {
+	rpcStatsCh chan stats.RPCStats
+}
+
+func (h *mockStatsHandler) TagRPC(ctx context.Context, _ *stats.RPCTagInfo) context.Context {
+	return ctx
+}
+
+func (h *mockStatsHandler) HandleRPC(_ context.Context, s stats.RPCStats) {
+	h.rpcStatsCh <- s
+}
+
+func (h *mockStatsHandler) TagConn(ctx context.Context, _ *stats.ConnTagInfo) context.Context {
+	return ctx
+}
+
+func (h *mockStatsHandler) HandleConn(context.Context, stats.ConnStats) {
+}
+
+func newHandleStreamTest(t *testing.T, statsHandler stats.Handler) *handleStreamTest {
 	bodyr, bodyw := io.Pipe()
 	req := &http.Request{
 		ProtoMajor: 2,
@@ -259,7 +280,7 @@ func newHandleStreamTest(t *testing.T) *handleStreamTest {
 		Body: bodyr,
 	}
 	rw := newTestHandlerResponseWriter().(testHandlerResponseWriter)
-	ht, err := NewServerHandlerTransport(rw, req, nil)
+	ht, err := NewServerHandlerTransport(rw, req, statsHandler, mem.DefaultBufferPool())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -272,8 +293,8 @@ func newHandleStreamTest(t *testing.T) *handleStreamTest {
 }
 
 func (s) TestHandlerTransport_HandleStreams(t *testing.T) {
-	st := newHandleStreamTest(t)
-	handleStream := func(s *Stream) {
+	st := newHandleStreamTest(t, nil)
+	handleStream := func(s *ServerStream) {
 		if want := "/service/foo.bar"; s.method != want {
 			t.Errorf("stream method = %q; want %q", s.method, want)
 		}
@@ -309,10 +330,12 @@ func (s) TestHandlerTransport_HandleStreams(t *testing.T) {
 		}
 
 		st.bodyw.Close() // no body
-		st.ht.WriteStatus(s, status.New(codes.OK, ""))
+		s.WriteStatus(status.New(codes.OK, ""))
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
 	st.ht.HandleStreams(
-		context.Background(), func(s *Stream) { go handleStream(s) },
+		ctx, func(s *ServerStream) { go handleStream(s) },
 	)
 	wantHeader := http.Header{
 		"Date":          nil,
@@ -339,13 +362,15 @@ func (s) TestHandlerTransport_HandleStreams_InvalidArgument(t *testing.T) {
 }
 
 func handleStreamCloseBodyTest(t *testing.T, statusCode codes.Code, msg string) {
-	st := newHandleStreamTest(t)
+	st := newHandleStreamTest(t, nil)
 
-	handleStream := func(s *Stream) {
-		st.ht.WriteStatus(s, status.New(statusCode, msg))
+	handleStream := func(s *ServerStream) {
+		s.WriteStatus(status.New(statusCode, msg))
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
 	st.ht.HandleStreams(
-		context.Background(), func(s *Stream) { go handleStream(s) },
+		ctx, func(s *ServerStream) { go handleStream(s) },
 	)
 	wantHeader := http.Header{
 		"Date":         nil,
@@ -374,11 +399,11 @@ func (s) TestHandlerTransport_HandleStreams_Timeout(t *testing.T) {
 		Body: bodyr,
 	}
 	rw := newTestHandlerResponseWriter().(testHandlerResponseWriter)
-	ht, err := NewServerHandlerTransport(rw, req, nil)
+	ht, err := NewServerHandlerTransport(rw, req, nil, mem.DefaultBufferPool())
 	if err != nil {
 		t.Fatal(err)
 	}
-	runStream := func(s *Stream) {
+	runStream := func(s *ServerStream) {
 		defer bodyw.Close()
 		select {
 		case <-s.ctx.Done():
@@ -391,10 +416,12 @@ func (s) TestHandlerTransport_HandleStreams_Timeout(t *testing.T) {
 			t.Errorf("ctx.Err = %v; want %v", err, context.DeadlineExceeded)
 			return
 		}
-		ht.WriteStatus(s, status.New(codes.DeadlineExceeded, "too slow"))
+		s.WriteStatus(status.New(codes.DeadlineExceeded, "too slow"))
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
 	ht.HandleStreams(
-		context.Background(), func(s *Stream) { go runStream(s) },
+		ctx, func(s *ServerStream) { go runStream(s) },
 	)
 	wantHeader := http.Header{
 		"Date":         nil,
@@ -411,7 +438,7 @@ func (s) TestHandlerTransport_HandleStreams_Timeout(t *testing.T) {
 // TestHandlerTransport_HandleStreams_MultiWriteStatus ensures that
 // concurrent "WriteStatus"s do not panic writing to closed "writes" channel.
 func (s) TestHandlerTransport_HandleStreams_MultiWriteStatus(t *testing.T) {
-	testHandlerTransportHandleStreams(t, func(st *handleStreamTest, s *Stream) {
+	testHandlerTransportHandleStreams(t, func(st *handleStreamTest, s *ServerStream) {
 		if want := "/service/foo.bar"; s.method != want {
 			t.Errorf("stream method = %q; want %q", s.method, want)
 		}
@@ -422,7 +449,7 @@ func (s) TestHandlerTransport_HandleStreams_MultiWriteStatus(t *testing.T) {
 		for i := 0; i < 5; i++ {
 			go func() {
 				defer wg.Done()
-				st.ht.WriteStatus(s, status.New(codes.OK, ""))
+				s.WriteStatus(status.New(codes.OK, ""))
 			}()
 		}
 		wg.Wait()
@@ -432,21 +459,23 @@ func (s) TestHandlerTransport_HandleStreams_MultiWriteStatus(t *testing.T) {
 // TestHandlerTransport_HandleStreams_WriteStatusWrite ensures that "Write"
 // following "WriteStatus" does not panic writing to closed "writes" channel.
 func (s) TestHandlerTransport_HandleStreams_WriteStatusWrite(t *testing.T) {
-	testHandlerTransportHandleStreams(t, func(st *handleStreamTest, s *Stream) {
+	testHandlerTransportHandleStreams(t, func(st *handleStreamTest, s *ServerStream) {
 		if want := "/service/foo.bar"; s.method != want {
 			t.Errorf("stream method = %q; want %q", s.method, want)
 		}
 		st.bodyw.Close() // no body
 
-		st.ht.WriteStatus(s, status.New(codes.OK, ""))
-		st.ht.Write(s, []byte("hdr"), []byte("data"), &Options{})
+		s.WriteStatus(status.New(codes.OK, ""))
+		s.Write([]byte("hdr"), newBufferSlice([]byte("data")), &WriteOptions{})
 	})
 }
 
-func testHandlerTransportHandleStreams(t *testing.T, handleStream func(st *handleStreamTest, s *Stream)) {
-	st := newHandleStreamTest(t)
+func testHandlerTransportHandleStreams(t *testing.T, handleStream func(st *handleStreamTest, s *ServerStream)) {
+	st := newHandleStreamTest(t, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	t.Cleanup(cancel)
 	st.ht.HandleStreams(
-		context.Background(), func(s *Stream) { go handleStream(st, s) },
+		ctx, func(s *ServerStream) { go handleStream(st, s) },
 	)
 }
 
@@ -474,12 +503,14 @@ func (s) TestHandlerTransport_HandleStreams_ErrDetails(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	hst := newHandleStreamTest(t)
-	handleStream := func(s *Stream) {
-		hst.ht.WriteStatus(s, st)
+	hst := newHandleStreamTest(t, nil)
+	handleStream := func(s *ServerStream) {
+		s.WriteStatus(st)
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
 	hst.ht.HandleStreams(
-		context.Background(), func(s *Stream) { go handleStream(s) },
+		ctx, func(s *ServerStream) { go handleStream(s) },
 	)
 	wantHeader := http.Header{
 		"Date":         nil,
@@ -495,13 +526,74 @@ func (s) TestHandlerTransport_HandleStreams_ErrDetails(t *testing.T) {
 	checkHeaderAndTrailer(t, hst.rw, wantHeader, wantTrailer)
 }
 
-// TestHandlerTransport_Drain verifies that Drain() is not implemented
-// by `serverHandlerTransport`.
-func (s) TestHandlerTransport_Drain(t *testing.T) {
-	defer func() { recover() }()
-	st := newHandleStreamTest(t)
-	st.ht.Drain("whatever")
-	t.Errorf("serverHandlerTransport.Drain() should have panicked")
+// Tests the use of stats handlers and ensures there are no data races while
+// accessing trailers.
+func (s) TestHandlerTransport_HandleStreams_StatsHandlers(t *testing.T) {
+	errDetails := []protoadapt.MessageV1{
+		&epb.RetryInfo{
+			RetryDelay: &durationpb.Duration{Seconds: 60},
+		},
+		&epb.ResourceInfo{
+			ResourceType: "foo bar",
+			ResourceName: "service.foo.bar",
+			Owner:        "User",
+		},
+	}
+
+	statusCode := codes.ResourceExhausted
+	msg := "you are being throttled"
+	st, err := status.New(statusCode, msg).WithDetails(errDetails...)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stBytes, err := proto.Marshal(st.Proto())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Add mock stats handlers to exercise the stats handler code path.
+	statsHandler := &mockStatsHandler{
+		rpcStatsCh: make(chan stats.RPCStats, 2),
+	}
+	hst := newHandleStreamTest(t, statsHandler)
+	handleStream := func(s *ServerStream) {
+		if err := s.SendHeader(metadata.New(map[string]string{})); err != nil {
+			t.Error(err)
+		}
+		if err := s.SetTrailer(metadata.Pairs("custom-trailer", "Custom trailer value")); err != nil {
+			t.Error(err)
+		}
+		s.WriteStatus(st)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	hst.ht.HandleStreams(
+		ctx, func(s *ServerStream) { go handleStream(s) },
+	)
+	wantHeader := http.Header{
+		"Date":         nil,
+		"Content-Type": {"application/grpc"},
+		"Trailer":      {"Grpc-Status", "Grpc-Message", "Grpc-Status-Details-Bin"},
+	}
+	wantTrailer := http.Header{
+		"Grpc-Status":             {fmt.Sprint(uint32(statusCode))},
+		"Grpc-Message":            {encodeGrpcMessage(msg)},
+		"Grpc-Status-Details-Bin": {encodeBinHeader(stBytes)},
+		"Custom-Trailer":          []string{"Custom trailer value"},
+	}
+
+	checkHeaderAndTrailer(t, hst.rw, wantHeader, wantTrailer)
+	wantStatTypes := []stats.RPCStats{&stats.OutHeader{}, &stats.OutTrailer{}}
+	for _, wantType := range wantStatTypes {
+		select {
+		case <-ctx.Done():
+			t.Fatal("Context timed out waiting for statsHandler.HandleRPC() to be called.")
+		case s := <-statsHandler.rpcStatsCh:
+			if reflect.TypeOf(s) != reflect.TypeOf(wantType) {
+				t.Fatalf("Received RPCStats of type %T, want %T", s, wantType)
+			}
+		}
+	}
 }
 
 // checkHeaderAndTrailer checks that the resulting header and trailer matches the expectation.

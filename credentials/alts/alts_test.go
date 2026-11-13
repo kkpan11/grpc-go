@@ -36,6 +36,7 @@ import (
 	altspb "google.golang.org/grpc/credentials/alts/internal/proto/grpc_gcp"
 	"google.golang.org/grpc/credentials/alts/internal/testutil"
 	"google.golang.org/grpc/internal/grpctest"
+	"google.golang.org/grpc/internal/stubserver"
 	"google.golang.org/grpc/internal/testutils"
 	testgrpc "google.golang.org/grpc/interop/grpc_testing"
 	testpb "google.golang.org/grpc/interop/grpc_testing"
@@ -90,6 +91,7 @@ func (s) TestCloneClient(t *testing.T) {
 	opt := DefaultClientOptions()
 	opt.TargetServiceAccounts = []string{"not", "empty"}
 	c := NewClientCreds(opt)
+	c.(*altsTC).boundAccessToken = "bound-access-token"
 	c.OverrideServerName(wantServerName)
 	cc := c.Clone()
 	if got, want := cc.Info().ServerName, wantServerName; got != want {
@@ -107,13 +109,16 @@ func (s) TestCloneClient(t *testing.T) {
 	cct := cc.(*altsTC)
 
 	if ct.side != cct.side {
-		t.Errorf("cc.side = %q, want %q", cct.side, ct.side)
+		t.Errorf("cc.side = %d, want %d", cct.side, ct.side)
 	}
 	if ct.hsAddress != cct.hsAddress {
 		t.Errorf("cc.hsAddress = %q, want %q", cct.hsAddress, ct.hsAddress)
 	}
 	if !reflect.DeepEqual(ct.accounts, cct.accounts) {
 		t.Errorf("cc.accounts = %q, want %q", cct.accounts, ct.accounts)
+	}
+	if ct.boundAccessToken != cct.boundAccessToken {
+		t.Errorf("cc.boundAccessToken = %q, want %q", cct.boundAccessToken, ct.boundAccessToken)
 	}
 }
 
@@ -137,7 +142,7 @@ func (s) TestCloneServer(t *testing.T) {
 	cct := cc.(*altsTC)
 
 	if ct.side != cct.side {
-		t.Errorf("cc.side = %q, want %q", cct.side, ct.side)
+		t.Errorf("cc.side = %d, want %d", cct.side, ct.side)
 	}
 	if ct.hsAddress != cct.hsAddress {
 		t.Errorf("cc.hsAddress = %q, want %q", cct.hsAddress, ct.hsAddress)
@@ -152,9 +157,6 @@ func (s) TestInfo(t *testing.T) {
 	// use NewServerCreds and not NewClientCreds.
 	c := NewServerCreds(DefaultServerOptions())
 	info := c.Info()
-	if got, want := info.ProtocolVersion, ""; got != want {
-		t.Errorf("info.ProtocolVersion=%v, want %v", got, want)
-	}
 	if got, want := info.SecurityProtocol, "alts"; got != want {
 		t.Errorf("info.SecurityProtocol=%v, want %v", got, want)
 	}
@@ -323,11 +325,33 @@ func (s) TestFullHandshake(t *testing.T) {
 	defer wait.Wait()
 	stopHandshaker, handshakerAddress := startFakeHandshakerService(t, &wait)
 	defer stopHandshaker()
-	stopServer, serverAddress := startServer(t, handshakerAddress, &wait)
+	stopServer, serverAddress := startServer(t, handshakerAddress)
 	defer stopServer()
 
 	// Ping the server, authenticating with ALTS.
 	establishAltsConnection(t, handshakerAddress, serverAddress)
+
+	// Close open connections to the fake handshaker service.
+	if err := service.CloseForTesting(); err != nil {
+		t.Errorf("service.CloseForTesting() failed: %v", err)
+	}
+}
+
+// TestHandshakeWithAccessToken performs an ALTS handshake between a test client and
+// server, where both client and server offload to a local, fake handshaker
+// service, and expects the StartClient request to include a bound access token.
+func (s) TestHandshakeWithAccessToken(t *testing.T) {
+	// Start the fake handshaker service and the server.
+	var wait sync.WaitGroup
+	defer wait.Wait()
+	boundAccessToken := "fake-bound-access-token"
+	stopHandshaker, handshakerAddress := startFakeHandshakerServiceWithExpectedBoundAccessToken(t, &wait, boundAccessToken)
+	defer stopHandshaker()
+	stopServer, serverAddress := startServer(t, handshakerAddress)
+	defer stopServer()
+
+	// Ping the server, authenticating with ALTS and a bound access token.
+	establishAltsConnectionWithBoundAccessToken(t, handshakerAddress, serverAddress, boundAccessToken)
 
 	// Close open connections to the fake handshaker service.
 	if err := service.CloseForTesting(); err != nil {
@@ -349,7 +373,7 @@ func (s) TestConcurrentHandshakes(t *testing.T) {
 	defer wait.Wait()
 	stopHandshaker, handshakerAddress := startFakeHandshakerService(t, &wait)
 	defer stopHandshaker()
-	stopServer, serverAddress := startServer(t, handshakerAddress, &wait)
+	stopServer, serverAddress := startServer(t, handshakerAddress)
 	defer stopServer()
 
 	// Ping the server, authenticating with ALTS.
@@ -384,7 +408,15 @@ func versions(minMajor, minMinor, maxMajor, maxMinor uint32) *altspb.RpcProtocol
 }
 
 func establishAltsConnection(t *testing.T, handshakerAddress, serverAddress string) {
+	establishAltsConnectionWithBoundAccessToken(t, handshakerAddress, serverAddress, "")
+}
+
+func establishAltsConnectionWithBoundAccessToken(t *testing.T, handshakerAddress, serverAddress, boundAccessToken string) {
 	clientCreds := NewClientCreds(&ClientOptions{HandshakerServiceAddress: handshakerAddress})
+	if boundAccessToken != "" {
+		altsCreds := clientCreds.(*altsTC)
+		altsCreds.boundAccessToken = boundAccessToken
+	}
 	conn, err := grpc.NewClient(serverAddress, grpc.WithTransportCredentials(clientCreds))
 	if err != nil {
 		t.Fatalf("grpc.NewClient(%v) failed: %v", serverAddress, err)
@@ -428,12 +460,20 @@ func establishAltsConnection(t *testing.T, handshakerAddress, serverAddress stri
 }
 
 func startFakeHandshakerService(t *testing.T, wait *sync.WaitGroup) (stop func(), address string) {
+	return startFakeHandshakerServiceWithExpectedBoundAccessToken(t, wait, "")
+}
+
+func startFakeHandshakerServiceWithExpectedBoundAccessToken(t *testing.T, wait *sync.WaitGroup, boundAccessToken string) (stop func(), address string) {
 	listener, err := testutils.LocalTCPListener()
 	if err != nil {
 		t.Fatalf("LocalTCPListener() failed: %v", err)
 	}
 	s := grpc.NewServer()
-	altsgrpc.RegisterHandshakerServiceServer(s, &testutil.FakeHandshaker{})
+	hs := &testutil.FakeHandshaker{}
+	if boundAccessToken != "" {
+		hs.ExpectedBoundAccessToken = boundAccessToken
+	}
+	altsgrpc.RegisterHandshakerServiceServer(s, hs)
 	wait.Add(1)
 	go func() {
 		defer wait.Done()
@@ -444,31 +484,22 @@ func startFakeHandshakerService(t *testing.T, wait *sync.WaitGroup) (stop func()
 	return func() { s.Stop() }, listener.Addr().String()
 }
 
-func startServer(t *testing.T, handshakerServiceAddress string, wait *sync.WaitGroup) (stop func(), address string) {
+func startServer(t *testing.T, handshakerServiceAddress string) (stop func(), address string) {
 	listener, err := testutils.LocalTCPListener()
 	if err != nil {
 		t.Fatalf("LocalTCPListener() failed: %v", err)
 	}
 	serverOpts := &ServerOptions{HandshakerServiceAddress: handshakerServiceAddress}
 	creds := NewServerCreds(serverOpts)
-	s := grpc.NewServer(grpc.Creds(creds))
-	testgrpc.RegisterTestServiceServer(s, &testServer{})
-	wait.Add(1)
-	go func() {
-		defer wait.Done()
-		if err := s.Serve(listener); err != nil {
-			t.Errorf("s.Serve(%v) failed: %v", listener, err)
-		}
-	}()
-	return func() { s.Stop() }, listener.Addr().String()
-}
-
-type testServer struct {
-	testgrpc.UnimplementedTestServiceServer
-}
-
-func (s *testServer) UnaryCall(ctx context.Context, in *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
-	return &testpb.SimpleResponse{
-		Payload: &testpb.Payload{},
-	}, nil
+	stub := &stubserver.StubServer{
+		Listener: listener,
+		UnaryCallF: func(context.Context, *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+			return &testpb.SimpleResponse{
+				Payload: &testpb.Payload{},
+			}, nil
+		},
+		S: grpc.NewServer(grpc.Creds(creds)),
+	}
+	stubserver.StartTestService(t, stub)
+	return func() { stub.S.Stop() }, listener.Addr().String()
 }

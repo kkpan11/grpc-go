@@ -20,21 +20,27 @@
 package grpctest
 
 import (
+	"context"
 	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/internal/leakcheck"
 )
 
 var lcFailed uint32
 
-type errorer struct {
+type logger struct {
 	t *testing.T
 }
 
-func (e errorer) Errorf(format string, args ...any) {
+func (e logger) Logf(format string, args ...any) {
+	e.t.Logf(format, args...)
+}
+
+func (e logger) Errorf(format string, args ...any) {
 	atomic.StoreUint32(&lcFailed, 1)
 	e.t.Errorf(format, args...)
 }
@@ -47,19 +53,34 @@ type Tester struct{}
 
 // Setup updates the tlogger.
 func (Tester) Setup(t *testing.T) {
-	TLogger.Update(t)
+	tLogr.update(t)
+	// TODO: There is one final leak around closing connections without completely
+	//  draining the recvBuffer that has yet to be resolved. All other leaks have been
+	//  completely addressed, and this can be turned back on as soon as this issue is
+	//  fixed.
+	leakcheck.SetTrackingBufferPool(logger{t: t})
+	leakcheck.TrackTimers()
+	leakcheck.TrackAsyncReporters()
 }
 
 // Teardown performs a leak check.
 func (Tester) Teardown(t *testing.T) {
+	leakcheck.CheckTrackingBufferPool()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	leakcheck.CheckTimers(ctx, logger{t: t})
 	if atomic.LoadUint32(&lcFailed) == 1 {
 		return
 	}
-	leakcheck.Check(errorer{t: t})
+	leakcheck.CheckGoroutines(ctx, logger{t: t})
 	if atomic.LoadUint32(&lcFailed) == 1 {
-		t.Log("Leak check disabled for future tests")
+		t.Log("Goroutine leak check disabled for future tests")
 	}
-	TLogger.EndTest(t)
+	leakcheck.CheckAsyncReporters(logger{t: t})
+	if atomic.LoadUint32(&lcFailed) == 1 {
+		return
+	}
+	tLogr.endTest(t)
 }
 
 // Interface defines Tester's methods for use in this package.

@@ -23,7 +23,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -33,7 +33,6 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/internal"
 	"google.golang.org/grpc/internal/balancer/stub"
 	"google.golang.org/grpc/internal/channelz"
 	"google.golang.org/grpc/internal/grpctest"
@@ -98,19 +97,17 @@ func registerWrappedRoundRobinPolicy(t *testing.T) chan struct{} {
 	closeCh := make(chan struct{}, 1)
 	stub.Register(roundrobin.Name, stub.BalancerFuncs{
 		Init: func(bd *stub.BalancerData) {
-			bd.Data = rrBuilder.Build(bd.ClientConn, bd.BuildOptions)
+			bd.ChildBalancer = rrBuilder.Build(bd.ClientConn, bd.BuildOptions)
 		},
 		UpdateClientConnState: func(bd *stub.BalancerData, ccs balancer.ClientConnState) error {
-			bal := bd.Data.(balancer.Balancer)
-			return bal.UpdateClientConnState(ccs)
+			return bd.ChildBalancer.UpdateClientConnState(ccs)
 		},
 		Close: func(bd *stub.BalancerData) {
 			select {
 			case closeCh <- struct{}{}:
 			default:
 			}
-			bal := bd.Data.(balancer.Balancer)
-			bal.Close()
+			bd.ChildBalancer.Close()
 		},
 	})
 	t.Cleanup(func() { balancer.Register(rrBuilder) })
@@ -131,11 +128,12 @@ func (s) TestChannelIdleness_Disabled_NoActivity(t *testing.T) {
 		grpc.WithIdleTimeout(0), // Disable idleness.
 		grpc.WithDefaultServiceConfig(`{"loadBalancingConfig": [{"round_robin":{}}]}`),
 	}
-	cc, err := grpc.Dial(r.Scheme()+":///test.server", dopts...)
+	cc, err := grpc.NewClient(r.Scheme()+":///test.server", dopts...)
 	if err != nil {
-		t.Fatalf("grpc.Dial() failed: %v", err)
+		t.Fatalf("grpc.NewClient() failed: %v", err)
 	}
 	defer cc.Close()
+	cc.Connect()
 
 	// Start a test backend and push an address update via the resolver.
 	backend := stubserver.StartTestService(t, nil)
@@ -177,12 +175,13 @@ func (s) TestChannelIdleness_Enabled_NoActivity(t *testing.T) {
 		grpc.WithIdleTimeout(defaultTestShortIdleTimeout),
 		grpc.WithDefaultServiceConfig(`{"loadBalancingConfig": [{"round_robin":{}}]}`),
 	}
-	cc, err := grpc.Dial(r.Scheme()+":///test.server", dopts...)
+	cc, err := grpc.NewClient(r.Scheme()+":///test.server", dopts...)
 	if err != nil {
-		t.Fatalf("grpc.Dial() failed: %v", err)
+		t.Fatalf("grpc.NewClient() failed: %v", err)
 	}
 	defer cc.Close()
 
+	cc.Connect()
 	// Start a test backend and push an address update via the resolver.
 	lis := testutils.NewListenerWrapper(t, nil)
 	backend := stubserver.StartTestService(t, &stubserver.StubServer{Listener: lis})
@@ -265,21 +264,21 @@ func (s) TestChannelIdleness_Enabled_OngoingCall(t *testing.T) {
 				grpc.WithIdleTimeout(defaultTestShortIdleTimeout),
 				grpc.WithDefaultServiceConfig(`{"loadBalancingConfig": [{"round_robin":{}}]}`),
 			}
-			cc, err := grpc.Dial(r.Scheme()+":///test.server", dopts...)
+			cc, err := grpc.NewClient(r.Scheme()+":///test.server", dopts...)
 			if err != nil {
-				t.Fatalf("grpc.Dial() failed: %v", err)
+				t.Fatalf("grpc.NewClient() failed: %v", err)
 			}
 			defer cc.Close()
-
+			cc.Connect()
 			// Start a test backend that keeps the RPC call active by blocking
 			// on a channel that is closed by the test later on.
 			blockCh := make(chan struct{})
 			backend := &stubserver.StubServer{
-				EmptyCallF: func(ctx context.Context, in *testpb.Empty) (*testpb.Empty, error) {
+				EmptyCallF: func(context.Context, *testpb.Empty) (*testpb.Empty, error) {
 					<-blockCh
 					return &testpb.Empty{}, nil
 				},
-				FullDuplexCallF: func(stream testgrpc.TestService_FullDuplexCallServer) error {
+				FullDuplexCallF: func(testgrpc.TestService_FullDuplexCallServer) error {
 					<-blockCh
 					return nil
 				},
@@ -354,12 +353,12 @@ func (s) TestChannelIdleness_Enabled_ActiveSinceLastCheck(t *testing.T) {
 		grpc.WithIdleTimeout(defaultTestShortIdleTimeout),
 		grpc.WithDefaultServiceConfig(`{"loadBalancingConfig": [{"round_robin":{}}]}`),
 	}
-	cc, err := grpc.Dial(r.Scheme()+":///test.server", dopts...)
+	cc, err := grpc.NewClient(r.Scheme()+":///test.server", dopts...)
 	if err != nil {
-		t.Fatalf("grpc.Dial() failed: %v", err)
+		t.Fatalf("grpc.NewClient() failed: %v", err)
 	}
 	defer cc.Close()
-
+	cc.Connect()
 	// Start a test backend and push an address update via the resolver.
 	backend := stubserver.StartTestService(t, nil)
 	defer backend.Stop()
@@ -423,12 +422,12 @@ func (s) TestChannelIdleness_Enabled_ExitIdleOnRPC(t *testing.T) {
 		grpc.WithIdleTimeout(defaultTestShortIdleTimeout),
 		grpc.WithDefaultServiceConfig(`{"loadBalancingConfig": [{"round_robin":{}}]}`),
 	}
-	cc, err := grpc.Dial(r.Scheme()+":///test.server", dopts...)
+	cc, err := grpc.NewClient(r.Scheme()+":///test.server", dopts...)
 	if err != nil {
-		t.Fatalf("grpc.Dial() failed: %v", err)
+		t.Fatalf("grpc.NewClient() failed: %v", err)
 	}
 	defer cc.Close()
-
+	cc.Connect()
 	// Verify that the ClientConn moves to READY.
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
@@ -550,72 +549,41 @@ func (s) TestChannelIdleness_Connect(t *testing.T) {
 	testutils.AwaitState(ctx, t, cc, connectivity.Ready)
 }
 
-// runFunc runs f repeatedly until the context expires.
-func runFunc(ctx context.Context, f func()) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(10 * time.Millisecond):
-			f()
-		}
-	}
-}
-
-// Tests the scenario where there are concurrent calls to exit and enter idle
-// mode on the ClientConn. Verifies that there is no race under this scenario.
-func (s) TestChannelIdleness_RaceBetweenEnterAndExitIdleMode(t *testing.T) {
-	// Start a test backend and set the bootstrap state of the resolver to
-	// include this address. This will ensure that when the resolver is
-	// restarted when exiting idle, it will push the same address to grpc again.
-	r := manual.NewBuilderWithScheme("whatever")
+// TestChannelIdleness_RPCFailingBeforeAttempt_FinishesOnce verifies that an
+// RPC which fails during stream creation, before any attempt is started, is
+// reported as finished exactly once.
+func (s) TestChannelIdleness_RPCFailingBeforeAttempt_FinishesOnce(t *testing.T) {
 	backend := stubserver.StartTestService(t, nil)
 	defer backend.Stop()
-	r.InitialState(resolver.State{Addresses: []resolver.Address{{Addr: backend.Address}}})
 
-	// Create a ClientConn with a long idle_timeout. We will explicitly trigger
-	// entering and exiting IDLE mode from the test.
-	dopts := []grpc.DialOption{
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithResolvers(r),
-		grpc.WithIdleTimeout(30 * time.Minute),
-		grpc.WithDefaultServiceConfig(`{"loadBalancingConfig": [{"pick_first":{}}]}`),
-	}
-	cc, err := grpc.NewClient(r.Scheme()+":///test.server", dopts...)
+	cc, err := grpc.NewClient(fmt.Sprintf("dns:///%s", backend.Address), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("grpc.NewClient() failed: %v", err)
 	}
 	defer cc.Close()
 
-	enterIdle := internal.EnterIdleModeForTesting.(func(*grpc.ClientConn))
-	enterIdleFunc := func() { enterIdle(cc) }
-	exitIdle := internal.ExitIdleModeForTesting.(func(*grpc.ClientConn) error)
-	exitIdleFunc := func() {
-		if err := exitIdle(cc); err != nil {
-			t.Errorf("Failed to exit idle mode: %v", err)
-		}
-	}
-	// Spawn goroutines that call methods on the ClientConn to enter and exit
-	// idle mode concurrently for one second.
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
-	var wg sync.WaitGroup
-	wg.Add(4)
-	go func() {
-		runFunc(ctx, enterIdleFunc)
-		wg.Done()
-	}()
-	go func() {
-		runFunc(ctx, enterIdleFunc)
-		wg.Done()
-	}()
-	go func() {
-		runFunc(ctx, exitIdleFunc)
-		wg.Done()
-	}()
-	go func() {
-		runFunc(ctx, exitIdleFunc)
-		wg.Done()
-	}()
-	wg.Wait()
+
+	client := testgrpc.NewTestServiceClient(cc)
+
+	// Warm-up RPC: moves the channel to READY and fires the resolver's
+	// first-resolution event, so that the next RPC does not block waiting for
+	// addresses and instead proceeds to fail during stream creation.
+	if _, err := client.EmptyCall(ctx, &testpb.Empty{}); err != nil {
+		t.Fatalf("EmptyCall() failed: %v", err)
+	}
+
+	// Issue an RPC with an already-canceled context so that it fails during
+	// stream creation, before any attempt is started, and count how many times
+	// gRPC reports it as finished. The contract is exactly once.
+	var finishCount atomic.Int32
+	cancel()
+	_, err = client.EmptyCall(ctx, &testpb.Empty{}, grpc.OnFinish(func(error) { finishCount.Add(1) }))
+	if got, want := status.Code(err), codes.Canceled; got != want {
+		t.Fatalf("EmptyCall() with canceled context returned code %v, want %v (err: %v)", got, want, err)
+	}
+	if got := finishCount.Load(); got != 1 {
+		t.Fatalf("OnFinish callback invoked %d times, want exactly 1", got)
+	}
 }

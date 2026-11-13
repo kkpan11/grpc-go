@@ -22,7 +22,8 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"sync"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -110,62 +111,54 @@ func (s) TestGracefulStop(t *testing.T) {
 		closeCalled:  make(chan struct{}),
 		allowCloseCh: make(chan struct{}),
 	}
-	d := func(ctx context.Context, _ string) (net.Conn, error) { return dlis.Dial(ctx) }
 
 	ss := &stubserver.StubServer{
+		Listener: dlis,
 		FullDuplexCallF: func(stream testgrpc.TestService_FullDuplexCallServer) error {
-			_, err := stream.Recv()
-			if err != nil {
+			if _, err := stream.Recv(); err != nil {
 				return err
 			}
 			return stream.Send(&testpb.StreamingOutputCallResponse{})
 		},
+		S: grpc.NewServer(),
 	}
-	s := grpc.NewServer()
-	testgrpc.RegisterTestServiceServer(s, ss)
+	// 1. Start Server and start serving by calling Serve().
+	stubserver.StartTestService(t, ss)
 
-	// 1. Start Server
-	wg := sync.WaitGroup{}
-	wg.Add(1)
-	go func() {
-		s.Serve(dlis)
-		wg.Done()
-	}()
-
-	// 2. GracefulStop() Server after listener's Accept is called, but don't
-	//    allow Accept() to exit when Close() is called on it.
+	// 2. Call GracefulStop from a goroutine. It will trigger Close on the
+	// listener, but the listener will not actually close until a connection
+	// is accepted.
+	gracefulStopDone := make(chan struct{})
 	<-dlis.acceptCalled
-	wg.Add(1)
 	go func() {
-		s.GracefulStop()
-		wg.Done()
+		ss.S.GracefulStop()
+		close(gracefulStopDone)
 	}()
 
 	// 3. Create a new connection to the server after listener.Close() is called.
-	//    Server should close this connection immediately, before handshaking.
+	// Server should close this connection immediately, before handshaking.
 
 	<-dlis.closeCalled // Block until GracefulStop calls dlis.Close()
 
-	// Now dial.  The listener's Accept method will return a valid connection,
-	// even though GracefulStop has closed the listener.
-	ctx, dialCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
-	defer dialCancel()
-	cc, err := grpc.DialContext(ctx, "", grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithContextDialer(d))
+	dialer := func(ctx context.Context, _ string) (net.Conn, error) { return dlis.Dial(ctx) }
+	cc, err := grpc.NewClient("passthrough:///", grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithContextDialer(dialer))
 	if err != nil {
-		t.Fatalf("grpc.DialContext(_, %q, _) = %v", lis.Addr().String(), err)
+		t.Fatalf("grpc.NewClient(%q) = %v", lis.Addr().String(), err)
 	}
 	client := testgrpc.NewTestServiceClient(cc)
 	defer cc.Close()
 
-	// 4. Send an RPC on the new connection.
+	// 4. Make an RPC.
 	// The server would send a GOAWAY first, but we are delaying the server's
 	// writes for now until the client writes more than the preface.
+	// This will cause a connection to be accepted. This will
+	// also unblock the Close method.
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	if _, err = client.FullDuplexCall(ctx); err == nil || status.Code(err) != codes.Unavailable {
 		t.Fatalf("FullDuplexCall= _, %v; want _, <status code Unavailable>", err)
 	}
 	cancel()
-	wg.Wait()
+	<-gracefulStopDone
 }
 
 // TestGracefulStopClosesConnAfterLastStream ensures that a server closes the
@@ -176,7 +169,7 @@ func (s) TestGracefulStopClosesConnAfterLastStream(t *testing.T) {
 	handlerCalled := make(chan struct{})
 	gracefulStopCalled := make(chan struct{})
 
-	ts := &funcServer{streamingInputCall: func(stream testgrpc.TestService_StreamingInputCallServer) error {
+	ts := &funcServer{streamingInputCall: func(testgrpc.TestService_StreamingInputCallServer) error {
 		close(handlerCalled) // Initiate call to GracefulStop.
 		<-gracefulStopCalled // Wait for GOAWAYs to be received by the client.
 		return nil
@@ -225,7 +218,7 @@ func (s) TestGracefulStopBlocksUntilGRPCConnectionsTerminate(t *testing.T) {
 	unblockGRPCCall := make(chan struct{})
 	grpcCallExecuting := make(chan struct{})
 	ss := &stubserver.StubServer{
-		UnaryCallF: func(ctx context.Context, in *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+		UnaryCallF: func(context.Context, *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
 			close(grpcCallExecuting)
 			<-unblockGRPCCall
 			return &testpb.SimpleResponse{}, nil
@@ -241,7 +234,9 @@ func (s) TestGracefulStopBlocksUntilGRPCConnectionsTerminate(t *testing.T) {
 	grpcClientCallReturned := make(chan struct{})
 	go func() {
 		clt := ss.Client
-		_, err := clt.UnaryCall(context.Background(), &testpb.SimpleRequest{})
+		ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+		defer cancel()
+		_, err := clt.UnaryCall(ctx, &testpb.SimpleRequest{})
 		if err != nil {
 			t.Errorf("rpc failed with error: %s", err)
 		}
@@ -274,7 +269,7 @@ func (s) TestStopAbortsBlockingGRPCCall(t *testing.T) {
 	unblockGRPCCall := make(chan struct{})
 	grpcCallExecuting := make(chan struct{})
 	ss := &stubserver.StubServer{
-		UnaryCallF: func(ctx context.Context, in *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+		UnaryCallF: func(context.Context, *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
 			close(grpcCallExecuting)
 			<-unblockGRPCCall
 			return &testpb.SimpleResponse{}, nil
@@ -290,7 +285,9 @@ func (s) TestStopAbortsBlockingGRPCCall(t *testing.T) {
 	grpcClientCallReturned := make(chan struct{})
 	go func() {
 		clt := ss.Client
-		_, err := clt.UnaryCall(context.Background(), &testpb.SimpleRequest{})
+		ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+		defer cancel()
+		_, err := clt.UnaryCall(ctx, &testpb.SimpleRequest{})
 		if err == nil || !isConnClosedErr(err) {
 			t.Errorf("expected rpc to fail with connection closed error, got: %v", err)
 		}
@@ -302,4 +299,147 @@ func (s) TestStopAbortsBlockingGRPCCall(t *testing.T) {
 
 	unblockGRPCCall <- struct{}{}
 	<-grpcClientCallReturned
+}
+
+// TestStopAfterGracefulStopWithRunningHandler verifies that Stop() returns
+// promptly when called concurrently with an in-progress GracefulStop() that is
+// blocked waiting on a handler which ignores context cancellation. This is the
+// recommended way to abort a GracefulStop that takes too long, and it must not
+// deadlock behind the server mutex.
+func (s) TestStopAfterGracefulStopWithRunningHandler(t *testing.T) {
+	handlerStarted := make(chan struct{})
+	unblockHandler := make(chan struct{})
+	ss := &stubserver.StubServer{
+		FullDuplexCallF: func(_ testgrpc.TestService_FullDuplexCallServer) error {
+			close(handlerStarted)
+			// Ignore context cancellation to simulate a handler that does not
+			// promptly return when the server shuts down.
+			<-unblockHandler
+			return nil
+		},
+	}
+	if err := ss.Start(nil); err != nil {
+		t.Fatalf("Error starting endpoint server: %v", err)
+	}
+	defer ss.Stop()
+	// The handler blocks until unblockHandler is closed. If the test fails
+	// before reaching the normal unblock point below, this ensures the handler
+	// is released so its goroutine does not leak. handlerUnblocked guards
+	// against closing the channel twice.
+	handlerUnblocked := false
+	defer func() {
+		if !handlerUnblocked {
+			close(unblockHandler)
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+
+	if _, err := ss.Client.FullDuplexCall(ctx); err != nil {
+		t.Fatalf("Error starting FullDuplexCall: %v", err)
+	}
+	select {
+	case <-handlerStarted:
+	case <-ctx.Done():
+		t.Fatalf("Timed out waiting for the handler to start: %v", ctx.Err())
+	}
+
+	// Close the client connection so the server transport drains while the
+	// handler is still running. GracefulStop will then remove the connection
+	// and block waiting on the running handler.
+	ss.CC.Close()
+
+	gracefulStopReturned := make(chan struct{})
+	go func() {
+		ss.S.GracefulStop()
+		close(gracefulStopReturned)
+	}()
+
+	// Give GracefulStop time to drain the connection and start waiting on the
+	// running handler.
+	time.Sleep(defaultTestShortTimeout)
+
+	stopReturned := make(chan struct{})
+	go func() {
+		ss.S.Stop()
+		close(stopReturned)
+	}()
+
+	select {
+	case <-stopReturned:
+	case <-time.After(defaultTestTimeout):
+		t.Fatal("Timed out waiting for Stop() to return")
+	}
+
+	// Let the handler finish so GracefulStop can also return.
+	close(unblockHandler)
+	handlerUnblocked = true
+	select {
+	case <-gracefulStopReturned:
+	case <-time.After(defaultTestTimeout):
+		t.Fatal("GracefulStop() did not return after the handler completed")
+	}
+}
+
+// TestServeHTTP_GracefulStop verifies that calling GracefulStop on a server
+// using ServeHTTP returns properly.
+func (s) TestServeHTTP_GracefulStop(t *testing.T) {
+	gs := grpc.NewServer()
+	defer gs.Stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+
+	// Register a service that blocks until context is done to make sure the
+	// server is active when GracefulStop is called.
+	callStarted := make(chan struct{})
+	testgrpc.RegisterTestServiceServer(gs, &stubserver.StubServer{
+		FullDuplexCallF: func(testgrpc.TestService_FullDuplexCallServer) error {
+			close(callStarted)
+			<-ctx.Done()
+			return nil
+		},
+	})
+
+	// Create a handler that delegates to ServeHTTP and signals when it returns.
+	serveHTTPDone := make(chan struct{})
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gs.ServeHTTP(w, r)
+		close(serveHTTPDone)
+	})
+
+	// Start an HTTP/2 server with the wrapped handler.
+	ts := httptest.NewUnstartedServer(handler)
+	ts.EnableHTTP2 = true
+	ts.StartTLS()
+	defer ts.Close()
+
+	// Make a new request to the gRPC server via HTTP/2 to ensure HandleStreams is called.
+	req, err := http.NewRequest("POST", ts.URL+"/grpc.testing.TestService/FullDuplexCall", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/grpc")
+
+	client := ts.Client()
+	// Send the request in a goroutine.
+	go func() {
+		resp, err := client.Do(req)
+		if err != nil {
+			return
+		}
+		resp.Body.Close()
+	}()
+
+	<-callStarted
+	// Call GracefulStop in a goroutine to avoid blocking the main thread until the RPC is done.
+	go gs.GracefulStop()
+
+	// Verify that ServeHTTP returned because GracefulStop is called and ensure it doesn't panic.
+	select {
+	case <-serveHTTPDone:
+	case <-ctx.Done():
+		t.Fatal("Context timed out waiting for ServeHTTP to return after GracefulStop")
+	}
 }

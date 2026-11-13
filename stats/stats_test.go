@@ -22,13 +22,14 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net"
 	"reflect"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/internal"
 	"google.golang.org/grpc/internal/grpctest"
@@ -38,6 +39,7 @@ import (
 	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/testing/protocmp"
 
 	testgrpc "google.golang.org/grpc/interop/grpc_testing"
 	testpb "google.golang.org/grpc/interop/grpc_testing"
@@ -92,87 +94,105 @@ func payloadToID(p *testpb.Payload) int32 {
 	return int32(p.Body[0]) + int32(p.Body[1])<<8 + int32(p.Body[2])<<16 + int32(p.Body[3])<<24
 }
 
-type testServer struct {
-	testgrpc.UnimplementedTestServiceServer
+func setIncomingStats(ctx context.Context, mdKey string, b []byte) context.Context {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		md = metadata.MD{}
+	}
+	md.Set(mdKey, string(b))
+	return metadata.NewIncomingContext(ctx, md)
 }
 
-func (s *testServer) UnaryCall(ctx context.Context, in *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
-	if err := grpc.SendHeader(ctx, testHeaderMetadata); err != nil {
-		return nil, status.Errorf(status.Code(err), "grpc.SendHeader(_, %v) = %v, want <nil>", testHeaderMetadata, err)
+func getOutgoingStats(ctx context.Context, mdKey string) []byte {
+	md, ok := metadata.FromOutgoingContext(ctx)
+	if !ok {
+		return nil
 	}
-	if err := grpc.SetTrailer(ctx, testTrailerMetadata); err != nil {
-		return nil, status.Errorf(status.Code(err), "grpc.SetTrailer(_, %v) = %v, want <nil>", testTrailerMetadata, err)
+	tagValues := md.Get(mdKey)
+	if len(tagValues) == 0 {
+		return nil
 	}
-
-	if id := payloadToID(in.Payload); id == errorID {
-		return nil, fmt.Errorf("got error id: %v", id)
-	}
-
-	return &testpb.SimpleResponse{Payload: in.Payload}, nil
+	return []byte(tagValues[len(tagValues)-1])
 }
 
-func (s *testServer) FullDuplexCall(stream testgrpc.TestService_FullDuplexCallServer) error {
-	if err := stream.SendHeader(testHeaderMetadata); err != nil {
-		return status.Errorf(status.Code(err), "%v.SendHeader(%v) = %v, want %v", stream, testHeaderMetadata, err, nil)
-	}
-	stream.SetTrailer(testTrailerMetadata)
-	for {
-		in, err := stream.Recv()
-		if err == io.EOF {
-			// read done.
+func newStatsTestStubServer() *stubserver.StubServer {
+	return &stubserver.StubServer{
+		UnaryCallF: func(ctx context.Context, in *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+			if err := grpc.SendHeader(ctx, testHeaderMetadata); err != nil {
+				return nil, status.Errorf(status.Code(err), "grpc.SendHeader(_, %v) = %v, want <nil>", testHeaderMetadata, err)
+			}
+			if err := grpc.SetTrailer(ctx, testTrailerMetadata); err != nil {
+				return nil, status.Errorf(status.Code(err), "grpc.SetTrailer(_, %v) = %v, want <nil>", testTrailerMetadata, err)
+			}
+
+			if id := payloadToID(in.Payload); id == errorID {
+				return nil, fmt.Errorf("got error id: %v", id)
+			}
+
+			return &testpb.SimpleResponse{Payload: in.Payload}, nil
+		},
+		FullDuplexCallF: func(stream testgrpc.TestService_FullDuplexCallServer) error {
+			if err := stream.SendHeader(testHeaderMetadata); err != nil {
+				return status.Errorf(status.Code(err), "%v.SendHeader(%v) = %v, want %v", stream, testHeaderMetadata, err, nil)
+			}
+			stream.SetTrailer(testTrailerMetadata)
+			for {
+				in, err := stream.Recv()
+				if err == io.EOF {
+					// read done.
+					return nil
+				}
+				if err != nil {
+					return err
+				}
+
+				if id := payloadToID(in.Payload); id == errorID {
+					return fmt.Errorf("got error id: %v", id)
+				}
+
+				if err := stream.Send(&testpb.StreamingOutputCallResponse{Payload: in.Payload}); err != nil {
+					return err
+				}
+			}
+		},
+		StreamingInputCallF: func(stream testgrpc.TestService_StreamingInputCallServer) error {
+			if err := stream.SendHeader(testHeaderMetadata); err != nil {
+				return status.Errorf(status.Code(err), "%v.SendHeader(%v) = %v, want %v", stream, testHeaderMetadata, err, nil)
+			}
+			stream.SetTrailer(testTrailerMetadata)
+			for {
+				in, err := stream.Recv()
+				if err == io.EOF {
+					// read done.
+					return stream.SendAndClose(&testpb.StreamingInputCallResponse{AggregatedPayloadSize: 0})
+				}
+				if err != nil {
+					return err
+				}
+
+				if id := payloadToID(in.Payload); id == errorID {
+					return fmt.Errorf("got error id: %v", id)
+				}
+			}
+		},
+		StreamingOutputCallF: func(req *testpb.StreamingOutputCallRequest, stream testgrpc.TestService_StreamingOutputCallServer) error {
+			if err := stream.SendHeader(testHeaderMetadata); err != nil {
+				return status.Errorf(status.Code(err), "%v.SendHeader(%v) = %v, want %v", stream, testHeaderMetadata, err, nil)
+			}
+			stream.SetTrailer(testTrailerMetadata)
+
+			if id := payloadToID(req.Payload); id == errorID {
+				return fmt.Errorf("got error id: %v", id)
+			}
+
+			for i := 0; i < 5; i++ {
+				if err := stream.Send(&testpb.StreamingOutputCallResponse{Payload: req.Payload}); err != nil {
+					return err
+				}
+			}
 			return nil
-		}
-		if err != nil {
-			return err
-		}
-
-		if id := payloadToID(in.Payload); id == errorID {
-			return fmt.Errorf("got error id: %v", id)
-		}
-
-		if err := stream.Send(&testpb.StreamingOutputCallResponse{Payload: in.Payload}); err != nil {
-			return err
-		}
+		},
 	}
-}
-
-func (s *testServer) StreamingInputCall(stream testgrpc.TestService_StreamingInputCallServer) error {
-	if err := stream.SendHeader(testHeaderMetadata); err != nil {
-		return status.Errorf(status.Code(err), "%v.SendHeader(%v) = %v, want %v", stream, testHeaderMetadata, err, nil)
-	}
-	stream.SetTrailer(testTrailerMetadata)
-	for {
-		in, err := stream.Recv()
-		if err == io.EOF {
-			// read done.
-			return stream.SendAndClose(&testpb.StreamingInputCallResponse{AggregatedPayloadSize: 0})
-		}
-		if err != nil {
-			return err
-		}
-
-		if id := payloadToID(in.Payload); id == errorID {
-			return fmt.Errorf("got error id: %v", id)
-		}
-	}
-}
-
-func (s *testServer) StreamingOutputCall(in *testpb.StreamingOutputCallRequest, stream testgrpc.TestService_StreamingOutputCallServer) error {
-	if err := stream.SendHeader(testHeaderMetadata); err != nil {
-		return status.Errorf(status.Code(err), "%v.SendHeader(%v) = %v, want %v", stream, testHeaderMetadata, err, nil)
-	}
-	stream.SetTrailer(testTrailerMetadata)
-
-	if id := payloadToID(in.Payload); id == errorID {
-		return fmt.Errorf("got error id: %v", id)
-	}
-
-	for i := 0; i < 5; i++ {
-		if err := stream.Send(&testpb.StreamingOutputCallResponse{Payload: in.Payload}); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // test is an end-to-end test. It should be created with the newTest
@@ -184,9 +204,8 @@ type test struct {
 	clientStatsHandlers []stats.Handler
 	serverStatsHandlers []stats.Handler
 
-	testServer testgrpc.TestServiceServer // nil means none
 	// srv and srvAddr are set once startServer is called.
-	srv     *grpc.Server
+	srv     stubserver.GRPCServer
 	srvAddr string
 
 	cc *grpc.ClientConn // nil until requested via clientConn
@@ -219,12 +238,7 @@ func newTest(t *testing.T, tc *testConfig, chs []stats.Handler, shs []stats.Hand
 
 // startServer starts a gRPC server listening. Callers should defer a
 // call to te.tearDown to clean up.
-func (te *test) startServer(ts testgrpc.TestServiceServer) {
-	te.testServer = ts
-	lis, err := net.Listen("tcp", "localhost:0")
-	if err != nil {
-		te.t.Fatalf("Failed to listen: %v", err)
-	}
+func (te *test) startServer(ss *stubserver.StubServer) {
 	var opts []grpc.ServerOption
 	if te.compress == "gzip" {
 		opts = append(opts,
@@ -235,23 +249,19 @@ func (te *test) startServer(ts testgrpc.TestServiceServer) {
 	for _, sh := range te.serverStatsHandlers {
 		opts = append(opts, grpc.StatsHandler(sh))
 	}
-	s := grpc.NewServer(opts...)
-	te.srv = s
-	if te.testServer != nil {
-		testgrpc.RegisterTestServiceServer(s, te.testServer)
+	if err := ss.StartServer(opts...); err != nil {
+		te.t.Fatalf("StubServer.StartServer() failed: %v", err)
 	}
-
-	go s.Serve(lis)
-	te.srvAddr = lis.Addr().String()
+	te.srv = ss.S
+	te.srvAddr = ss.Address
 }
 
-func (te *test) clientConn() *grpc.ClientConn {
+func (te *test) clientConn(ctx context.Context) *grpc.ClientConn {
 	if te.cc != nil {
 		return te.cc
 	}
 	opts := []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
 		grpc.WithUserAgent("test/0.0.1"),
 	}
 	if te.compress == "gzip" {
@@ -265,10 +275,12 @@ func (te *test) clientConn() *grpc.ClientConn {
 	}
 
 	var err error
-	te.cc, err = grpc.Dial(te.srvAddr, opts...)
+	te.cc, err = grpc.NewClient(te.srvAddr, opts...)
 	if err != nil {
-		te.t.Fatalf("Dial(%q) = %v", te.srvAddr, err)
+		te.t.Fatalf("grpc.NewClient(%q) failed: %v", te.srvAddr, err)
 	}
+	te.cc.Connect()
+	testutils.AwaitState(ctx, te.t, te.cc, connectivity.Ready)
 	return te.cc
 }
 
@@ -282,10 +294,11 @@ const (
 )
 
 type rpcConfig struct {
-	count    int  // Number of requests and responses for streaming RPCs.
-	success  bool // Whether the RPC should succeed or return error.
-	failfast bool
-	callType rpcType // Type of RPC.
+	count     int  // Number of requests and responses for streaming RPCs.
+	success   bool // Whether the RPC should succeed or return error.
+	failfast  bool
+	authority string  // Authority override for the RPC.
+	callType  rpcType // Type of RPC.
 }
 
 func (te *test) doUnaryCall(c *rpcConfig) (*testpb.SimpleRequest, *testpb.SimpleResponse, error) {
@@ -294,16 +307,20 @@ func (te *test) doUnaryCall(c *rpcConfig) (*testpb.SimpleRequest, *testpb.Simple
 		req  *testpb.SimpleRequest
 		err  error
 	)
-	tc := testgrpc.NewTestServiceClient(te.clientConn())
+	tCtx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	tc := testgrpc.NewTestServiceClient(te.clientConn(tCtx))
 	if c.success {
 		req = &testpb.SimpleRequest{Payload: idToPayload(errorID + 1)}
 	} else {
 		req = &testpb.SimpleRequest{Payload: idToPayload(errorID)}
 	}
 
-	tCtx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
-	defer cancel()
-	resp, err = tc.UnaryCall(metadata.NewOutgoingContext(tCtx, testMetadata), req, grpc.WaitForReady(!c.failfast))
+	callOpts := []grpc.CallOption{grpc.WaitForReady(!c.failfast)}
+	if c.authority != "" {
+		callOpts = append(callOpts, grpc.CallAuthority(c.authority))
+	}
+	resp, err = tc.UnaryCall(metadata.NewOutgoingContext(tCtx, testMetadata), req, callOpts...)
 	return req, resp, err
 }
 
@@ -313,9 +330,9 @@ func (te *test) doFullDuplexCallRoundtrip(c *rpcConfig) ([]proto.Message, []prot
 		resps []proto.Message
 		err   error
 	)
-	tc := testgrpc.NewTestServiceClient(te.clientConn())
 	tCtx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
+	tc := testgrpc.NewTestServiceClient(te.clientConn(tCtx))
 	stream, err := tc.FullDuplexCall(metadata.NewOutgoingContext(tCtx, testMetadata), grpc.WaitForReady(!c.failfast))
 	if err != nil {
 		return reqs, resps, err
@@ -354,9 +371,9 @@ func (te *test) doClientStreamCall(c *rpcConfig) ([]proto.Message, *testpb.Strea
 		resp *testpb.StreamingInputCallResponse
 		err  error
 	)
-	tc := testgrpc.NewTestServiceClient(te.clientConn())
 	tCtx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
+	tc := testgrpc.NewTestServiceClient(te.clientConn(tCtx))
 	stream, err := tc.StreamingInputCall(metadata.NewOutgoingContext(tCtx, testMetadata), grpc.WaitForReady(!c.failfast))
 	if err != nil {
 		return reqs, resp, err
@@ -384,16 +401,15 @@ func (te *test) doServerStreamCall(c *rpcConfig) (*testpb.StreamingOutputCallReq
 		resps []proto.Message
 		err   error
 	)
-
-	tc := testgrpc.NewTestServiceClient(te.clientConn())
+	tCtx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	tc := testgrpc.NewTestServiceClient(te.clientConn(tCtx))
 
 	var startID int32
 	if !c.success {
 		startID = errorID
 	}
 	req = &testpb.StreamingOutputCallRequest{Payload: idToPayload(startID)}
-	tCtx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
-	defer cancel()
 	stream, err := tc.StreamingOutputCall(metadata.NewOutgoingContext(tCtx, testMetadata), req, grpc.WaitForReady(!c.failfast))
 	if err != nil {
 		return req, resps, err
@@ -416,6 +432,7 @@ type expectedData struct {
 	isServerStream bool
 	serverAddr     string
 	compression    string
+	authority      string
 	reqIdx         int
 	requests       []proto.Message
 	respIdx        int
@@ -538,40 +555,29 @@ func checkInPayload(t *testing.T, d *gotData, e *expectedData) {
 	if d.ctx == nil {
 		t.Fatalf("d.ctx = nil, want <non-nil>")
 	}
+
+	var idx *int
+	var payloads []proto.Message
 	if d.client {
-		b, err := proto.Marshal(e.responses[e.respIdx])
-		if err != nil {
-			t.Fatalf("failed to marshal message: %v", err)
-		}
-		if reflect.TypeOf(st.Payload) != reflect.TypeOf(e.responses[e.respIdx]) {
-			t.Fatalf("st.Payload = %T, want %T", st.Payload, e.responses[e.respIdx])
-		}
-		e.respIdx++
-		if string(st.Data) != string(b) {
-			t.Fatalf("st.Data = %v, want %v", st.Data, b)
-		}
-		if st.Length != len(b) {
-			t.Fatalf("st.Length = %v, want %v", st.Length, len(b))
-		}
+		idx = &e.respIdx
+		payloads = e.responses
 	} else {
-		b, err := proto.Marshal(e.requests[e.reqIdx])
-		if err != nil {
-			t.Fatalf("failed to marshal message: %v", err)
-		}
-		if reflect.TypeOf(st.Payload) != reflect.TypeOf(e.requests[e.reqIdx]) {
-			t.Fatalf("st.Payload = %T, want %T", st.Payload, e.requests[e.reqIdx])
-		}
-		e.reqIdx++
-		if string(st.Data) != string(b) {
-			t.Fatalf("st.Data = %v, want %v", st.Data, b)
-		}
-		if st.Length != len(b) {
-			t.Fatalf("st.Length = %v, want %v", st.Length, len(b))
-		}
+		idx = &e.reqIdx
+		payloads = e.requests
 	}
+
+	wantPayload := payloads[*idx]
+	if diff := cmp.Diff(wantPayload, st.Payload.(proto.Message), protocmp.Transform()); diff != "" {
+		t.Fatalf("unexpected difference in st.Payload (-want +got):\n%s", diff)
+	}
+	*idx++
+	if st.Length != proto.Size(wantPayload) {
+		t.Fatalf("st.Length = %v, want %v", st.Length, proto.Size(wantPayload))
+	}
+
 	// Below are sanity checks that WireLength and RecvTime are populated.
 	// TODO: check values of WireLength and RecvTime.
-	if len(st.Data) > 0 && st.CompressedLength == 0 {
+	if st.Length > 0 && st.CompressedLength == 0 {
 		t.Fatalf("st.WireLength = %v with non-empty data, want <non-zero>",
 			st.CompressedLength)
 	}
@@ -580,7 +586,7 @@ func checkInPayload(t *testing.T, d *gotData, e *expectedData) {
 	}
 }
 
-func checkInTrailer(t *testing.T, d *gotData, e *expectedData) {
+func checkInTrailer(t *testing.T, d *gotData, _ *expectedData) {
 	var (
 		ok bool
 		st *stats.InTrailer
@@ -620,6 +626,13 @@ func checkOutHeader(t *testing.T, d *gotData, e *expectedData) {
 		if st.RemoteAddr.String() != e.serverAddr {
 			t.Fatalf("st.RemoteAddr = %v, want %v", st.RemoteAddr, e.serverAddr)
 		}
+		wantAuthority := e.authority
+		if wantAuthority == "" {
+			wantAuthority = e.serverAddr
+		}
+		if st.Authority != wantAuthority {
+			t.Fatalf("st.Authority = %s, want %s", st.Authority, wantAuthority)
+		}
 		// additional headers might be injected so instead of testing equality, test that all the
 		// expected headers keys have the expected header values.
 		for key := range testMetadata {
@@ -657,40 +670,29 @@ func checkOutPayload(t *testing.T, d *gotData, e *expectedData) {
 	if d.ctx == nil {
 		t.Fatalf("d.ctx = nil, want <non-nil>")
 	}
+
+	var idx *int
+	var payloads []proto.Message
 	if d.client {
-		b, err := proto.Marshal(e.requests[e.reqIdx])
-		if err != nil {
-			t.Fatalf("failed to marshal message: %v", err)
-		}
-		if reflect.TypeOf(st.Payload) != reflect.TypeOf(e.requests[e.reqIdx]) {
-			t.Fatalf("st.Payload = %T, want %T", st.Payload, e.requests[e.reqIdx])
-		}
-		e.reqIdx++
-		if string(st.Data) != string(b) {
-			t.Fatalf("st.Data = %v, want %v", st.Data, b)
-		}
-		if st.Length != len(b) {
-			t.Fatalf("st.Length = %v, want %v", st.Length, len(b))
-		}
+		idx = &e.reqIdx
+		payloads = e.requests
 	} else {
-		b, err := proto.Marshal(e.responses[e.respIdx])
-		if err != nil {
-			t.Fatalf("failed to marshal message: %v", err)
-		}
-		if reflect.TypeOf(st.Payload) != reflect.TypeOf(e.responses[e.respIdx]) {
-			t.Fatalf("st.Payload = %T, want %T", st.Payload, e.responses[e.respIdx])
-		}
-		e.respIdx++
-		if string(st.Data) != string(b) {
-			t.Fatalf("st.Data = %v, want %v", st.Data, b)
-		}
-		if st.Length != len(b) {
-			t.Fatalf("st.Length = %v, want %v", st.Length, len(b))
-		}
+		idx = &e.respIdx
+		payloads = e.responses
 	}
-	// Below are sanity checks that WireLength and SentTime are populated.
+
+	expectedPayload := payloads[*idx]
+	if !proto.Equal(st.Payload.(proto.Message), expectedPayload) {
+		t.Fatalf("st.Payload = %v, want %v", st.Payload, expectedPayload)
+	}
+	*idx++
+	if st.Length != proto.Size(expectedPayload) {
+		t.Fatalf("st.Length = %v, want %v", st.Length, proto.Size(expectedPayload))
+	}
+
+	// Below are sanity checks that Length, CompressedLength and SentTime are populated.
 	// TODO: check values of WireLength and SentTime.
-	if len(st.Data) > 0 && st.WireLength == 0 {
+	if st.Length > 0 && st.WireLength == 0 {
 		t.Fatalf("st.WireLength = %v with non-empty data, want <non-zero>",
 			st.WireLength)
 	}
@@ -699,7 +701,7 @@ func checkOutPayload(t *testing.T, d *gotData, e *expectedData) {
 	}
 }
 
-func checkOutTrailer(t *testing.T, d *gotData, e *expectedData) {
+func checkOutTrailer(t *testing.T, d *gotData, _ *expectedData) {
 	var (
 		ok bool
 		st *stats.OutTrailer
@@ -840,7 +842,7 @@ func checkServerStats(t *testing.T, got []*gotData, expect *expectedData, checkF
 func testServerStats(t *testing.T, tc *testConfig, cc *rpcConfig, checkFuncs []func(t *testing.T, d *gotData, e *expectedData)) {
 	h := &statshandler{}
 	te := newTest(t, tc, nil, []stats.Handler{h})
-	te.startServer(&testServer{})
+	te.startServer(newStatsTestStubServer())
 	defer te.tearDown()
 
 	var (
@@ -1140,7 +1142,7 @@ func checkClientStats(t *testing.T, got []*gotData, expect *expectedData, checkF
 func testClientStats(t *testing.T, tc *testConfig, cc *rpcConfig, checkFuncs map[int]*checkFuncWithCount) {
 	h := &statshandler{}
 	te := newTest(t, tc, []stats.Handler{h}, nil)
-	te.startServer(&testServer{})
+	te.startServer(newStatsTestStubServer())
 	defer te.tearDown()
 
 	var (
@@ -1221,6 +1223,7 @@ func testClientStats(t *testing.T, tc *testConfig, cc *rpcConfig, checkFuncs map
 		err:            err,
 		isClientStream: isClientStream,
 		isServerStream: isServerStream,
+		authority:      cc.authority,
 	}
 
 	h.mu.Lock()
@@ -1231,6 +1234,23 @@ func testClientStats(t *testing.T, tc *testConfig, cc *rpcConfig, checkFuncs map
 
 func (s) TestClientStatsUnaryRPC(t *testing.T) {
 	testClientStats(t, &testConfig{compress: ""}, &rpcConfig{success: true, failfast: false, callType: unaryRPC}, map[int]*checkFuncWithCount{
+		begin:      {checkBegin, 1},
+		outHeader:  {checkOutHeader, 1},
+		outPayload: {checkOutPayload, 1},
+		inHeader:   {checkInHeader, 1},
+		inPayload:  {checkInPayload, 1},
+		inTrailer:  {checkInTrailer, 1},
+		end:        {checkEnd, 1},
+	})
+}
+
+func (s) TestClientStatsUnaryRPCAuthority(t *testing.T) {
+	testClientStats(t, &testConfig{compress: ""}, &rpcConfig{
+		success:   true,
+		failfast:  false,
+		authority: "authority-override.example.com",
+		callType:  unaryRPC,
+	}, map[int]*checkFuncWithCount{
 		begin:      {checkBegin, 1},
 		outHeader:  {checkOutHeader, 1},
 		outPayload: {checkOutPayload, 1},
@@ -1332,19 +1352,19 @@ func (s) TestTags(t *testing.T) {
 	tCtx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
 	ctx := stats.SetTags(tCtx, b)
-	if tg := stats.OutgoingTags(ctx); !reflect.DeepEqual(tg, b) {
-		t.Errorf("OutgoingTags(%v) = %v; want %v", ctx, tg, b)
+	if tg := getOutgoingStats(ctx, "grpc-tags-bin"); !reflect.DeepEqual(tg, b) {
+		t.Errorf("getOutgoingStats(%v, grpc-tags-bin) = %v; want %v", ctx, tg, b)
 	}
 	if tg := stats.Tags(ctx); tg != nil {
 		t.Errorf("Tags(%v) = %v; want nil", ctx, tg)
 	}
 
-	ctx = stats.SetIncomingTags(tCtx, b)
+	ctx = setIncomingStats(tCtx, "grpc-tags-bin", b)
 	if tg := stats.Tags(ctx); !reflect.DeepEqual(tg, b) {
 		t.Errorf("Tags(%v) = %v; want %v", ctx, tg, b)
 	}
-	if tg := stats.OutgoingTags(ctx); tg != nil {
-		t.Errorf("OutgoingTags(%v) = %v; want nil", ctx, tg)
+	if tg := getOutgoingStats(ctx, "grpc-tags-bin"); tg != nil {
+		t.Errorf("getOutgoingStats(%v, grpc-tags-bin) = %v; want nil", ctx, tg)
 	}
 }
 
@@ -1353,19 +1373,19 @@ func (s) TestTrace(t *testing.T) {
 	tCtx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
 	ctx := stats.SetTrace(tCtx, b)
-	if tr := stats.OutgoingTrace(ctx); !reflect.DeepEqual(tr, b) {
-		t.Errorf("OutgoingTrace(%v) = %v; want %v", ctx, tr, b)
+	if tr := getOutgoingStats(ctx, "grpc-trace-bin"); !reflect.DeepEqual(tr, b) {
+		t.Errorf("getOutgoingStats(%v, grpc-trace-bin) = %v; want %v", ctx, tr, b)
 	}
 	if tr := stats.Trace(ctx); tr != nil {
 		t.Errorf("Trace(%v) = %v; want nil", ctx, tr)
 	}
 
-	ctx = stats.SetIncomingTrace(tCtx, b)
+	ctx = setIncomingStats(tCtx, "grpc-trace-bin", b)
 	if tr := stats.Trace(ctx); !reflect.DeepEqual(tr, b) {
 		t.Errorf("Trace(%v) = %v; want %v", ctx, tr, b)
 	}
-	if tr := stats.OutgoingTrace(ctx); tr != nil {
-		t.Errorf("OutgoingTrace(%v) = %v; want nil", ctx, tr)
+	if tr := getOutgoingStats(ctx, "grpc-trace-bin"); tr != nil {
+		t.Errorf("getOutgoingStats(%v, grpc-trace-bin) = %v; want nil", ctx, tr)
 	}
 }
 
@@ -1373,7 +1393,7 @@ func (s) TestMultipleClientStatsHandler(t *testing.T) {
 	h := &statshandler{}
 	tc := &testConfig{compress: ""}
 	te := newTest(t, tc, []stats.Handler{h, h}, nil)
-	te.startServer(&testServer{})
+	te.startServer(newStatsTestStubServer())
 	defer te.tearDown()
 
 	cc := &rpcConfig{success: false, failfast: false, callType: unaryRPC}
@@ -1419,7 +1439,7 @@ func (s) TestMultipleServerStatsHandler(t *testing.T) {
 	h := &statshandler{}
 	tc := &testConfig{compress: ""}
 	te := newTest(t, tc, nil, []stats.Handler{h, h})
-	te.startServer(&testServer{})
+	te.startServer(newStatsTestStubServer())
 	defer te.tearDown()
 
 	cc := &rpcConfig{success: false, failfast: false, callType: unaryRPC}
@@ -1502,7 +1522,7 @@ func (s) TestStatsHandlerCallsServerIsRegisteredMethod(t *testing.T) {
 		},
 	}
 	ss := &stubserver.StubServer{
-		UnaryCallF: func(ctx context.Context, in *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+		UnaryCallF: func(context.Context, *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
 			return &testpb.SimpleResponse{}, nil
 		},
 	}

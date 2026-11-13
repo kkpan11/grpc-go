@@ -16,6 +16,7 @@
  *
  */
 
+// Binary client is a client for the custom load balancer example.
 package main
 
 import (
@@ -60,14 +61,14 @@ func main() {
 
 	cc, err := grpc.NewClient(mr.Scheme()+":///", grpc.WithResolvers(mr), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		log.Fatalf("Failed to dial: %v", err)
+		log.Fatalf("grpc.NewClient() failed: %v", err)
 	}
 	defer cc.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 	defer cancel()
 	ec := pb.NewEchoClient(cc)
 	if err := waitForDistribution(ctx, ec); err != nil {
-		log.Fatalf(err.Error())
+		log.Fatal(err)
 	}
 	fmt.Println("Successful multiple iterations of 1:2 ratio")
 }

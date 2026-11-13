@@ -1,6 +1,3 @@
-// TODO(@gregorycooke) - Remove when only golang 1.19+ is supported
-//go:build go1.19
-
 /*
  *
  * Copyright 2021 gRPC authors.
@@ -404,7 +401,7 @@ func crlPemToDer(crlBytes []byte) []byte {
 
 // extractCRLIssuer extracts the raw ASN.1 encoding of the CRL issuer. Due to the design of
 // pkix.CertificateList and pkix.RDNSequence, it is not possible to reliably marshal the
-// parsed Issuer to it's original raw encoding.
+// parsed Issuer to its original raw encoding.
 func extractCRLIssuer(crlBytes []byte) ([]byte, error) {
 	if bytes.HasPrefix(crlBytes, crlPemPrefix) {
 		crlBytes = crlPemToDer(crlBytes)

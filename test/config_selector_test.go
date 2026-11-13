@@ -50,7 +50,7 @@ func (s) TestConfigSelector(t *testing.T) {
 	gotContextChan := testutils.NewChannelWithSize(1)
 
 	ss := &stubserver.StubServer{
-		EmptyCallF: func(ctx context.Context, in *testpb.Empty) (*testpb.Empty, error) {
+		EmptyCallF: func(ctx context.Context, _ *testpb.Empty) (*testpb.Empty, error) {
 			gotContextChan.SendContext(ctx, ctx)
 			return &testpb.Empty{}, nil
 		},
@@ -75,8 +75,6 @@ func (s) TestConfigSelector(t *testing.T) {
 
 	testMD := metadata.MD{"footest": []string{"bazbar"}}
 	mdOut := metadata.MD{"handler": []string{"value"}}
-
-	var onCommittedCalled bool
 
 	testCases := []struct {
 		name   string
@@ -130,16 +128,6 @@ func (s) TestConfigSelector(t *testing.T) {
 		},
 		wantMD:      nil,
 		wantTimeout: shorterTimeout,
-	}, {
-		name: "onCommitted callback",
-		md:   testMD,
-		config: &iresolver.RPCConfig{
-			OnCommitted: func() {
-				onCommittedCalled = true
-			},
-		},
-		wantMD:       testMD,
-		wantDeadline: ctxDeadline,
 	}}
 
 	for _, tc := range testCases {
@@ -160,7 +148,6 @@ func (s) TestConfigSelector(t *testing.T) {
 			})
 			ss.R.UpdateState(state) // Blocks until config selector is applied
 
-			onCommittedCalled = false
 			ctx := metadata.NewOutgoingContext(ctx, tc.md)
 			startTime := time.Now()
 			if _, err := ss.Client.EmptyCall(ctx, &testpb.Empty{}); fmt.Sprint(err) != fmt.Sprint(tc.wantErr) {
@@ -200,16 +187,12 @@ func (s) TestConfigSelector(t *testing.T) {
 			}
 
 			wantDeadline := tc.wantDeadline
-			if wantDeadline == (time.Time{}) {
+			if wantDeadline.Equal(time.Time{}) {
 				wantDeadline = startTime.Add(tc.wantTimeout)
 			}
 			deadlineGot, _ := gotContext.Deadline()
 			if diff := deadlineGot.Sub(wantDeadline); diff > time.Second || diff < -time.Second {
 				t.Errorf("received deadline = %v; want ~%v", deadlineGot, wantDeadline)
-			}
-
-			if tc.config != nil && tc.config.OnCommitted != nil && !onCommittedCalled {
-				t.Errorf("OnCommitted callback not called")
 			}
 		})
 	}

@@ -62,7 +62,7 @@ func (s) TestControlChannelThrottled(t *testing.T) {
 
 	select {
 	case <-rlsReqCh:
-		t.Fatal("RouteLookup RPC invoked when control channel is throtlled")
+		t.Fatal("RouteLookup RPC invoked when control channel is throttled")
 	case <-time.After(defaultTestShortTimeout):
 	}
 }
@@ -74,7 +74,7 @@ func (s) TestLookupFailure(t *testing.T) {
 	overrideAdaptiveThrottler(t, neverThrottlingThrottler())
 
 	// Setup the RLS server to respond with errors.
-	rlsServer.SetResponseCallback(func(_ context.Context, req *rlspb.RouteLookupRequest) *rlstest.RouteLookupResponse {
+	rlsServer.SetResponseCallback(func(context.Context, *rlspb.RouteLookupRequest) *rlstest.RouteLookupResponse {
 		return &rlstest.RouteLookupResponse{Err: errors.New("rls failure")}
 	})
 
@@ -109,7 +109,7 @@ func (s) TestLookupFailure(t *testing.T) {
 // respond within the configured rpc timeout.
 func (s) TestLookupDeadlineExceeded(t *testing.T) {
 	// A unary interceptor which returns a status error with DeadlineExceeded.
-	interceptor := func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp any, err error) {
+	interceptor := func(context.Context, any, *grpc.UnaryServerInfo, grpc.UnaryHandler) (resp any, err error) {
 		return nil, status.Error(codes.DeadlineExceeded, "deadline exceeded")
 	}
 
@@ -125,7 +125,7 @@ func (s) TestLookupDeadlineExceeded(t *testing.T) {
 	defer ctrlCh.close()
 
 	// Perform the lookup and expect the callback to be invoked with an error.
-	errCh := make(chan error)
+	errCh := make(chan error, 1)
 	ctrlCh.lookup(nil, rlspb.RouteLookupRequest_REASON_MISS, staleHeaderData, func(_ []string, _ string, err error) {
 		if st, ok := status.FromError(err); !ok || st.Code() != codes.DeadlineExceeded {
 			errCh <- fmt.Errorf("rlsClient.lookup() returned error: %v, want %v", err, codes.DeadlineExceeded)
@@ -260,7 +260,7 @@ func testControlChannelCredsSuccess(t *testing.T, sopts []grpc.ServerOption, bop
 	overrideAdaptiveThrottler(t, neverThrottlingThrottler())
 
 	// Setup the RLS server to respond with a valid response.
-	rlsServer.SetResponseCallback(func(_ context.Context, req *rlspb.RouteLookupRequest) *rlstest.RouteLookupResponse {
+	rlsServer.SetResponseCallback(func(context.Context, *rlspb.RouteLookupRequest) *rlstest.RouteLookupResponse {
 		return lookupResponse
 	})
 
@@ -367,7 +367,7 @@ func testControlChannelCredsFailure(t *testing.T, sopts []grpc.ServerOption, bop
 	defer ctrlCh.close()
 
 	// Perform the lookup and expect the callback to be invoked with an error.
-	errCh := make(chan error)
+	errCh := make(chan error, 1)
 	ctrlCh.lookup(nil, rlspb.RouteLookupRequest_REASON_MISS, staleHeaderData, func(_ []string, _ string, err error) {
 		if st, ok := status.FromError(err); !ok || st.Code() != wantCode || !wantErrRegex.MatchString(st.String()) {
 			errCh <- fmt.Errorf("rlsClient.lookup() returned error: %v, wantCode: %v, wantErr: %s", err, wantCode, wantErrRegex.String())

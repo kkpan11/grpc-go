@@ -25,12 +25,13 @@ import (
 	"io"
 	"reflect"
 	"strings"
-	"sync/atomic"
 	"testing"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/encoding"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/experimental"
+	"google.golang.org/grpc/internal/grpcutil"
 	"google.golang.org/grpc/internal/stubserver"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -38,6 +39,82 @@ import (
 	testgrpc "google.golang.org/grpc/interop/grpc_testing"
 	testpb "google.golang.org/grpc/interop/grpc_testing"
 )
+
+// TestUnsupportedEncodingResponse validates gRPC status codes
+// for different client-server compression setups
+// ensuring the correct behavior when compression is enabled or disabled on either side.
+func (s) TestUnsupportedEncodingResponse(t *testing.T) {
+	tests := []struct {
+		name           string
+		clientCompress bool
+		serverCompress bool
+		wantStatus     codes.Code
+	}{
+		{
+			name:           "client_server_compression",
+			clientCompress: true,
+			serverCompress: true,
+			wantStatus:     codes.OK,
+		},
+		{
+			name:           "client_compression",
+			clientCompress: true,
+			serverCompress: false,
+			wantStatus:     codes.Unimplemented,
+		},
+		{
+			name:           "server_compression",
+			clientCompress: false,
+			serverCompress: true,
+			wantStatus:     codes.Internal,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ss := &stubserver.StubServer{
+				UnaryCallF: func(_ context.Context, in *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+					return &testpb.SimpleResponse{Payload: in.Payload}, nil
+				},
+			}
+			sopts := []grpc.ServerOption{}
+			if test.serverCompress {
+				// Using deprecated methods to selectively apply compression
+				// only on the server side. With encoding.registerCompressor(),
+				// the compressor is applied globally, affecting client and server
+				sopts = append(sopts, grpc.RPCCompressor(newNopCompressor()), grpc.RPCDecompressor(newNopDecompressor()))
+			}
+			if err := ss.StartServer(sopts...); err != nil {
+				t.Fatalf("Error starting server: %v", err)
+			}
+			defer ss.Stop()
+
+			dopts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+			if test.clientCompress {
+				// UseCompressor() requires the compressor to be registered
+				// using encoding.RegisterCompressor() which applies compressor globally,
+				// Hence, using deprecated WithCompressor() and WithDecompressor()
+				// to apply compression only on client.
+				dopts = append(dopts, grpc.WithCompressor(newNopCompressor()), grpc.WithDecompressor(newNopDecompressor()))
+			}
+			if err := ss.StartClient(dopts...); err != nil {
+				t.Fatalf("Error starting client: %v", err)
+			}
+
+			payload := &testpb.SimpleRequest{
+				Payload: &testpb.Payload{
+					Body: []byte("test message"),
+				},
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+			defer cancel()
+			_, err := ss.Client.UnaryCall(ctx, payload)
+			if got, want := status.Code(err), test.wantStatus; got != want {
+				t.Errorf("Client.UnaryCall() = %v, want %v", got, want)
+			}
+		})
+	}
+}
 
 func (s) TestCompressServerHasNoSupport(t *testing.T) {
 	for _, e := range listTestEnv() {
@@ -224,7 +301,7 @@ func (s) TestClientForwardsGrpcAcceptEncodingHeader(t *testing.T) {
 	decompressor := renameDecompressor{Decompressor: grpc.NewGZIPDecompressor(), name: "testgzip"}
 
 	ss := &stubserver.StubServer{
-		EmptyCallF: func(ctx context.Context, in *testpb.Empty) (*testpb.Empty, error) {
+		EmptyCallF: func(ctx context.Context, _ *testpb.Empty) (*testpb.Empty, error) {
 			md, ok := metadata.FromIncomingContext(ctx)
 			if !ok {
 				return nil, status.Errorf(codes.Internal, "no metadata in context")
@@ -264,150 +341,6 @@ func (s) TestClientForwardsGrpcAcceptEncodingHeader(t *testing.T) {
 	}
 }
 
-// wrapCompressor is a wrapper of encoding.Compressor which maintains count of
-// Compressor method invokes.
-type wrapCompressor struct {
-	encoding.Compressor
-	compressInvokes int32
-}
-
-func (wc *wrapCompressor) Compress(w io.Writer) (io.WriteCloser, error) {
-	atomic.AddInt32(&wc.compressInvokes, 1)
-	return wc.Compressor.Compress(w)
-}
-
-func setupGzipWrapCompressor(t *testing.T) *wrapCompressor {
-	oldC := encoding.GetCompressor("gzip")
-	c := &wrapCompressor{Compressor: oldC}
-	encoding.RegisterCompressor(c)
-	t.Cleanup(func() {
-		encoding.RegisterCompressor(oldC)
-	})
-	return c
-}
-
-func (s) TestSetSendCompressorSuccess(t *testing.T) {
-	for _, tt := range []struct {
-		name                string
-		desc                string
-		payload             *testpb.Payload
-		dialOpts            []grpc.DialOption
-		resCompressor       string
-		wantCompressInvokes int32
-	}{
-		{
-			name:                "identity_request_and_gzip_response",
-			desc:                "request is uncompressed and response is gzip compressed",
-			payload:             &testpb.Payload{Body: []byte("payload")},
-			resCompressor:       "gzip",
-			wantCompressInvokes: 1,
-		},
-		{
-			name:                "identity_request_and_empty_response",
-			desc:                "request is uncompressed and response is gzip compressed",
-			payload:             nil,
-			resCompressor:       "gzip",
-			wantCompressInvokes: 0,
-		},
-		{
-			name:          "gzip_request_and_identity_response",
-			desc:          "request is gzip compressed and response is uncompressed with identity",
-			payload:       &testpb.Payload{Body: []byte("payload")},
-			resCompressor: "identity",
-			dialOpts: []grpc.DialOption{
-				// Use WithCompressor instead of UseCompressor to avoid counting
-				// the client's compressor usage.
-				grpc.WithCompressor(grpc.NewGZIPCompressor()),
-			},
-			wantCompressInvokes: 0,
-		},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Run("unary", func(t *testing.T) {
-				testUnarySetSendCompressorSuccess(t, tt.payload, tt.resCompressor, tt.wantCompressInvokes, tt.dialOpts)
-			})
-
-			t.Run("stream", func(t *testing.T) {
-				testStreamSetSendCompressorSuccess(t, tt.payload, tt.resCompressor, tt.wantCompressInvokes, tt.dialOpts)
-			})
-		})
-	}
-}
-
-func testUnarySetSendCompressorSuccess(t *testing.T, payload *testpb.Payload, resCompressor string, wantCompressInvokes int32, dialOpts []grpc.DialOption) {
-	wc := setupGzipWrapCompressor(t)
-	ss := &stubserver.StubServer{
-		UnaryCallF: func(ctx context.Context, in *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
-			if err := grpc.SetSendCompressor(ctx, resCompressor); err != nil {
-				return nil, err
-			}
-			return &testpb.SimpleResponse{
-				Payload: payload,
-			}, nil
-		},
-	}
-	if err := ss.Start(nil, dialOpts...); err != nil {
-		t.Fatalf("Error starting endpoint server: %v", err)
-	}
-	defer ss.Stop()
-
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
-	defer cancel()
-
-	if _, err := ss.Client.UnaryCall(ctx, &testpb.SimpleRequest{}); err != nil {
-		t.Fatalf("Unexpected unary call error, got: %v, want: nil", err)
-	}
-
-	compressInvokes := atomic.LoadInt32(&wc.compressInvokes)
-	if compressInvokes != wantCompressInvokes {
-		t.Fatalf("Unexpected compress invokes, got:%d, want: %d", compressInvokes, wantCompressInvokes)
-	}
-}
-
-func testStreamSetSendCompressorSuccess(t *testing.T, payload *testpb.Payload, resCompressor string, wantCompressInvokes int32, dialOpts []grpc.DialOption) {
-	wc := setupGzipWrapCompressor(t)
-	ss := &stubserver.StubServer{
-		FullDuplexCallF: func(stream testgrpc.TestService_FullDuplexCallServer) error {
-			if _, err := stream.Recv(); err != nil {
-				return err
-			}
-
-			if err := grpc.SetSendCompressor(stream.Context(), resCompressor); err != nil {
-				return err
-			}
-
-			return stream.Send(&testpb.StreamingOutputCallResponse{
-				Payload: payload,
-			})
-		},
-	}
-	if err := ss.Start(nil, dialOpts...); err != nil {
-		t.Fatalf("Error starting endpoint server: %v", err)
-	}
-	defer ss.Stop()
-
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
-	defer cancel()
-
-	s, err := ss.Client.FullDuplexCall(ctx)
-	if err != nil {
-		t.Fatalf("Unexpected full duplex call error, got: %v, want: nil", err)
-	}
-
-	if err := s.Send(&testpb.StreamingOutputCallRequest{}); err != nil {
-		t.Fatalf("Unexpected full duplex call send error, got: %v, want: nil", err)
-	}
-
-	if _, err := s.Recv(); err != nil {
-		t.Fatalf("Unexpected full duplex recv error, got: %v, want: nil", err)
-	}
-
-	compressInvokes := atomic.LoadInt32(&wc.compressInvokes)
-	if compressInvokes != wantCompressInvokes {
-		t.Fatalf("Unexpected compress invokes, got:%d, want: %d", compressInvokes, wantCompressInvokes)
-	}
-}
-
 func (s) TestUnregisteredSetSendCompressorFailure(t *testing.T) {
 	resCompressor := "snappy2"
 	wantErr := status.Error(codes.Unknown, "unable to set send compressor: compressor not registered \"snappy2\"")
@@ -423,7 +356,7 @@ func (s) TestUnregisteredSetSendCompressorFailure(t *testing.T) {
 
 func testUnarySetSendCompressorFailure(t *testing.T, resCompressor string, wantErr error) {
 	ss := &stubserver.StubServer{
-		EmptyCallF: func(ctx context.Context, in *testpb.Empty) (*testpb.Empty, error) {
+		EmptyCallF: func(ctx context.Context, _ *testpb.Empty) (*testpb.Empty, error) {
 			if err := grpc.SetSendCompressor(ctx, resCompressor); err != nil {
 				return nil, err
 			}
@@ -481,7 +414,7 @@ func testStreamSetSendCompressorFailure(t *testing.T, resCompressor string, want
 
 func (s) TestUnarySetSendCompressorAfterHeaderSendFailure(t *testing.T) {
 	ss := &stubserver.StubServer{
-		EmptyCallF: func(ctx context.Context, in *testpb.Empty) (*testpb.Empty, error) {
+		EmptyCallF: func(ctx context.Context, _ *testpb.Empty) (*testpb.Empty, error) {
 			// Send headers early and then set send compressor.
 			grpc.SendHeader(ctx, metadata.MD{})
 			err := grpc.SetSendCompressor(ctx, "gzip")
@@ -576,7 +509,7 @@ func (s) TestClientSupportedCompressors(t *testing.T) {
 	} {
 		t.Run(tt.desc, func(t *testing.T) {
 			ss := &stubserver.StubServer{
-				EmptyCallF: func(ctx context.Context, in *testpb.Empty) (*testpb.Empty, error) {
+				EmptyCallF: func(ctx context.Context, _ *testpb.Empty) (*testpb.Empty, error) {
 					got, err := grpc.ClientSupportedCompressors(ctx)
 					if err != nil {
 						return nil, err
@@ -597,6 +530,57 @@ func (s) TestClientSupportedCompressors(t *testing.T) {
 			_, err := ss.Client.EmptyCall(tt.ctx, &testpb.Empty{})
 			if err != nil {
 				t.Fatalf("Unexpected unary call error, got: %v, want: nil", err)
+			}
+		})
+	}
+}
+
+func (s) TestAcceptCompressorsCallOption(t *testing.T) {
+	tests := []struct {
+		name       string
+		callOption grpc.CallOption
+		wantHeader string
+	}{
+		{
+			name:       "with AcceptCompressors",
+			callOption: experimental.AcceptCompressors("gzip"),
+			wantHeader: "gzip",
+		},
+		{
+			name:       "without AcceptCompressors uses default",
+			callOption: nil,
+			wantHeader: grpcutil.RegisteredCompressors(),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ss := &stubserver.StubServer{
+				EmptyCallF: func(ctx context.Context, _ *testpb.Empty) (*testpb.Empty, error) {
+					md, _ := metadata.FromIncomingContext(ctx)
+					header := md.Get("grpc-accept-encoding")
+
+					if len(header) != 1 || header[0] != tt.wantHeader {
+						t.Errorf("unexpected grpc-accept-encoding header: got %v, want %v", header, tt.wantHeader)
+					}
+					return &testpb.Empty{}, nil
+				},
+			}
+			if err := ss.Start(nil); err != nil {
+				t.Fatalf("failed to start server: %v", err)
+			}
+			defer ss.Stop()
+
+			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+			defer cancel()
+
+			opts := []grpc.CallOption{}
+			if tt.callOption != nil {
+				opts = append(opts, tt.callOption)
+			}
+
+			if _, err := ss.Client.EmptyCall(ctx, &testpb.Empty{}, opts...); err != nil {
+				t.Fatalf("EmptyCall failed: %v", err)
 			}
 		})
 	}
@@ -686,7 +670,7 @@ func (badGzipCompressor) Type() string {
 
 func (s) TestGzipBadChecksum(t *testing.T) {
 	ss := &stubserver.StubServer{
-		UnaryCallF: func(ctx context.Context, _ *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+		UnaryCallF: func(context.Context, *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
 			return &testpb.SimpleResponse{}, nil
 		},
 	}

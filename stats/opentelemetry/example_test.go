@@ -19,12 +19,13 @@ package opentelemetry_test
 import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/stats/opentelemetry"
 
 	"go.opentelemetry.io/otel/sdk/metric"
 )
 
-func Example_dialOption() {
+func ExampleDialOption_basic() {
 	// This is setting default bounds for a view. Setting these bounds through
 	// meter provider from SDK is recommended, as API calls in this module
 	// provide default bounds, but these calls are not guaranteed to be stable
@@ -52,7 +53,7 @@ func Example_dialOption() {
 	opts := opentelemetry.Options{
 		MetricsOptions: opentelemetry.MetricsOptions{
 			MeterProvider: provider,
-			Metrics:       opentelemetry.DefaultMetrics, // equivalent to unset - distinct from empty
+			Metrics:       opentelemetry.DefaultMetrics(), // equivalent to unset - distinct from empty
 		},
 	}
 	do := opentelemetry.DialOption(opts)
@@ -63,7 +64,7 @@ func Example_dialOption() {
 	defer cc.Close()
 }
 
-func Example_serverOption() {
+func ExampleServerOption_methodFilter() {
 	reader := metric.NewManualReader()
 	provider := metric.NewMeterProvider(metric.WithReader(reader))
 	opts := opentelemetry.Options{
@@ -87,7 +88,7 @@ func ExampleMetrics_excludeSome() {
 	// To exclude specific metrics, initialize Options as follows:
 	opts := opentelemetry.Options{
 		MetricsOptions: opentelemetry.MetricsOptions{
-			Metrics: opentelemetry.DefaultMetrics.Remove(opentelemetry.ClientAttemptDuration, opentelemetry.ClientAttemptRcvdCompressedTotalMessageSize),
+			Metrics: opentelemetry.DefaultMetrics().Remove(opentelemetry.ClientAttemptDurationMetricName, opentelemetry.ClientAttemptRcvdCompressedTotalMessageSizeMetricName),
 		},
 	}
 	do := opentelemetry.DialOption(opts)
@@ -102,7 +103,7 @@ func ExampleMetrics_disableAll() {
 	// To disable all metrics, initialize Options as follows:
 	opts := opentelemetry.Options{
 		MetricsOptions: opentelemetry.MetricsOptions{
-			Metrics: opentelemetry.NewMetrics(), // Distinct to nil, which creates default metrics. This empty set creates no metrics.
+			Metrics: stats.NewMetricSet(), // Distinct to nil, which creates default metrics. This empty set creates no metrics.
 		},
 	}
 	do := opentelemetry.DialOption(opts)
@@ -117,13 +118,34 @@ func ExampleMetrics_enableSome() {
 	// To only create specific metrics, initialize Options as follows:
 	opts := opentelemetry.Options{
 		MetricsOptions: opentelemetry.MetricsOptions{
-			Metrics: opentelemetry.NewMetrics(opentelemetry.ClientAttemptDuration, opentelemetry.ClientAttemptRcvdCompressedTotalMessageSize), // only create these metrics
+			Metrics: stats.NewMetricSet(opentelemetry.ClientAttemptDurationMetricName, opentelemetry.ClientAttemptRcvdCompressedTotalMessageSizeMetricName), // only create these metrics
 		},
 	}
 	do := opentelemetry.DialOption(opts)
 	cc, err := grpc.NewClient("<target string>", do, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil { // might fail vet
 		// Handle err.
+	}
+	defer cc.Close()
+}
+
+func ExampleOptions_addExperimentalMetrics() {
+	opts := opentelemetry.Options{
+		MetricsOptions: opentelemetry.MetricsOptions{
+			// These are example experimental gRPC metrics, which are disabled
+			// by default and must be explicitly enabled. For the full,
+			// up-to-date list of metrics, see:
+			// https://grpc.io/docs/guides/opentelemetry-metrics/#instruments
+			Metrics: opentelemetry.DefaultMetrics().Add(
+				"grpc.subchannel.connection_attempts_succeeded",
+				"grpc.subchannel.connection_attempts_failed",
+			),
+		},
+	}
+	do := opentelemetry.DialOption(opts)
+	cc, err := grpc.NewClient("<target string>", do, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		// Handle error.
 	}
 	defer cc.Close()
 }

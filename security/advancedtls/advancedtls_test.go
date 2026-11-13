@@ -27,7 +27,9 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"google.golang.org/grpc/credentials"
@@ -59,7 +61,7 @@ type fakeProvider struct {
 	wantError     bool
 }
 
-func (f fakeProvider) KeyMaterial(ctx context.Context) (*certprovider.KeyMaterial, error) {
+func (f fakeProvider) KeyMaterial(context.Context) (*certprovider.KeyMaterial, error) {
 	if f.wantError {
 		return nil, fmt.Errorf("bad fakeProvider")
 	}
@@ -159,6 +161,7 @@ func (s) TestClientOptionsConfigSuccessCases(t *testing.T) {
 		MinVersion             uint16
 		MaxVersion             uint16
 		cipherSuites           []uint16
+		curvePreferences       []tls.CurveID
 	}{
 		{
 			desc:                   "Use system default if no fields in RootCertificateOptions is specified",
@@ -185,6 +188,24 @@ func (s) TestClientOptionsConfigSuccessCases(t *testing.T) {
 				tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
 			},
 		},
+		{
+			desc: "CurvePreferences plumbing through client options",
+			curvePreferences: []tls.CurveID{
+				tls.X25519,
+				tls.CurveP256,
+			},
+		},
+		{
+			desc:                   "MaxVersion default is applied when only MinVersion is set",
+			clientVerificationType: CertVerification,
+			IdentityOptions: IdentityCertificateOptions{
+				Certificates: []tls.Certificate{},
+			},
+			RootOptions: RootCertificateOptions{
+				RootProvider: fakeProvider{},
+			},
+			MinVersion: tls.VersionTLS12,
+		},
 	}
 	for _, test := range tests {
 		test := test
@@ -196,6 +217,7 @@ func (s) TestClientOptionsConfigSuccessCases(t *testing.T) {
 				MinTLSVersion:    test.MinVersion,
 				MaxTLSVersion:    test.MaxVersion,
 				CipherSuites:     test.cipherSuites,
+				CurvePreferences: test.curvePreferences,
 			}
 			clientConfig, err := clientOptions.clientConfig()
 			if err != nil {
@@ -229,6 +251,9 @@ func (s) TestClientOptionsConfigSuccessCases(t *testing.T) {
 			}
 			if diff := cmp.Diff(clientConfig.CipherSuites, test.cipherSuites); diff != "" {
 				t.Errorf("cipherSuites diff (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(clientConfig.CurvePreferences, test.curvePreferences); diff != "" {
+				t.Errorf("curvePreferences diff (-want +got):\n%s", diff)
 			}
 		})
 	}
@@ -315,6 +340,7 @@ func (s) TestServerOptionsConfigSuccessCases(t *testing.T) {
 		MinVersion             uint16
 		MaxVersion             uint16
 		cipherSuites           []uint16
+		curvePreferences       []tls.CurveID
 	}{
 		{
 			desc:                   "Use system default if no fields in RootCertificateOptions is specified",
@@ -354,6 +380,30 @@ func (s) TestServerOptionsConfigSuccessCases(t *testing.T) {
 				tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
 			},
 		},
+		{
+			desc:                   "MaxVersion default is applied when only MinVersion is set",
+			serverVerificationType: CertVerification,
+			IdentityOptions: IdentityCertificateOptions{
+				Certificates: []tls.Certificate{},
+			},
+			RootOptions: RootCertificateOptions{
+				RootProvider: fakeProvider{},
+			},
+			MinVersion: tls.VersionTLS12,
+		},
+		{
+			desc: "CurvePreferences plumbing through server options",
+			IdentityOptions: IdentityCertificateOptions{
+				Certificates: []tls.Certificate{},
+			},
+			RootOptions: RootCertificateOptions{
+				RootCertificates: x509.NewCertPool(),
+			},
+			curvePreferences: []tls.CurveID{
+				tls.X25519,
+				tls.CurveP256,
+			},
+		},
 	}
 	for _, test := range tests {
 		test := test
@@ -366,6 +416,7 @@ func (s) TestServerOptionsConfigSuccessCases(t *testing.T) {
 				MinTLSVersion:     test.MinVersion,
 				MaxTLSVersion:     test.MaxVersion,
 				CipherSuites:      test.cipherSuites,
+				CurvePreferences:  test.curvePreferences,
 			}
 			serverConfig, err := serverOptions.serverConfig()
 			if err != nil {
@@ -382,6 +433,9 @@ func (s) TestServerOptionsConfigSuccessCases(t *testing.T) {
 			if diff := cmp.Diff(serverConfig.CipherSuites, test.cipherSuites); diff != "" {
 				t.Errorf("cipherSuites diff (-want +got):\n%s", diff)
 			}
+			if diff := cmp.Diff(serverConfig.CurvePreferences, test.curvePreferences); diff != "" {
+				t.Errorf("curvePreferences diff (-want +got):\n%s", diff)
+			}
 		})
 	}
 }
@@ -391,13 +445,16 @@ func (s) TestClientServerHandshake(t *testing.T) {
 	if err := cs.LoadCerts(); err != nil {
 		t.Fatalf("cs.LoadCerts() failed, err: %v", err)
 	}
-	getRootCertificatesForClient := func(params *ConnectionInfo) (*RootCertificates, error) {
+	getRootCertificatesForClient := func(*ConnectionInfo) (*RootCertificates, error) {
 		return &RootCertificates{TrustCerts: cs.ClientTrust1}, nil
 	}
 
 	clientVerifyFuncGood := func(params *HandshakeVerificationInfo) (*PostHandshakeVerificationResults, error) {
 		if params.ServerName == "" {
 			return nil, errors.New("client side server name should have a value")
+		}
+		if params.ConnectionState.CurveID == 0 {
+			return nil, errors.New("client side key exchange algorithm should not be zero")
 		}
 		// "foo.bar.com" is the common name on server certificate server_cert_1.pem.
 		if len(params.VerifiedChains) > 0 && (params.Leaf == nil || params.Leaf.Subject.CommonName != "foo.bar.com") {
@@ -406,15 +463,18 @@ func (s) TestClientServerHandshake(t *testing.T) {
 
 		return &PostHandshakeVerificationResults{}, nil
 	}
-	verifyFuncBad := func(params *HandshakeVerificationInfo) (*PostHandshakeVerificationResults, error) {
+	verifyFuncBad := func(*HandshakeVerificationInfo) (*PostHandshakeVerificationResults, error) {
 		return nil, fmt.Errorf("custom verification function failed")
 	}
-	getRootCertificatesForServer := func(params *ConnectionInfo) (*RootCertificates, error) {
+	getRootCertificatesForServer := func(*ConnectionInfo) (*RootCertificates, error) {
 		return &RootCertificates{TrustCerts: cs.ServerTrust1}, nil
 	}
 	serverVerifyFunc := func(params *HandshakeVerificationInfo) (*PostHandshakeVerificationResults, error) {
 		if params.ServerName != "" {
 			return nil, errors.New("server side server name should not have a value")
+		}
+		if params.ConnectionState.CurveID == 0 {
+			return nil, errors.New("server side key exchange algorithm should not be zero")
 		}
 		// "foo.bar.hoo.com" is the common name on client certificate client_cert_1.pem.
 		if len(params.VerifiedChains) > 0 && (params.Leaf == nil || params.Leaf.Subject.CommonName != "foo.bar.hoo.com") {
@@ -423,15 +483,15 @@ func (s) TestClientServerHandshake(t *testing.T) {
 
 		return &PostHandshakeVerificationResults{}, nil
 	}
-	getRootCertificatesForServerBad := func(params *ConnectionInfo) (*RootCertificates, error) {
+	getRootCertificatesForServerBad := func(*ConnectionInfo) (*RootCertificates, error) {
 		return nil, fmt.Errorf("bad root certificate reloading")
 	}
 
-	getRootCertificatesForClientCRL := func(params *ConnectionInfo) (*RootCertificates, error) {
+	getRootCertificatesForClientCRL := func(*ConnectionInfo) (*RootCertificates, error) {
 		return &RootCertificates{TrustCerts: cs.ClientTrust3}, nil
 	}
 
-	getRootCertificatesForServerCRL := func(params *ConnectionInfo) (*RootCertificates, error) {
+	getRootCertificatesForServerCRL := func(*ConnectionInfo) (*RootCertificates, error) {
 		return &RootCertificates{TrustCerts: cs.ServerTrust3}, nil
 	}
 
@@ -458,6 +518,7 @@ func (s) TestClientServerHandshake(t *testing.T) {
 		clientRootProvider         certprovider.Provider
 		clientIdentityProvider     certprovider.Provider
 		clientRevocationOptions    *RevocationOptions
+		clientCurvePreferences     []tls.CurveID
 		clientExpectHandshakeError bool
 		serverMutualTLS            bool
 		serverCert                 []tls.Certificate
@@ -469,6 +530,7 @@ func (s) TestClientServerHandshake(t *testing.T) {
 		serverRootProvider         certprovider.Provider
 		serverIdentityProvider     certprovider.Provider
 		serverRevocationOptions    *RevocationOptions
+		serverCurvePreferences     []tls.CurveID
 		serverExpectError          bool
 	}{
 		// Client: nil setting except verifyFuncGood
@@ -558,14 +620,14 @@ func (s) TestClientServerHandshake(t *testing.T) {
 		// Expected Behavior: success
 		{
 			desc: "Client sets reload peer/root function with verifyFuncGood; Server sets reload peer/root function with verifyFuncGood; mutualTLS",
-			clientGetCert: func(info *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			clientGetCert: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
 				return &cs.ClientCert1, nil
 			},
 			clientGetRoot:          getRootCertificatesForClient,
 			clientVerifyFunc:       clientVerifyFuncGood,
 			clientVerificationType: CertVerification,
 			serverMutualTLS:        true,
-			serverGetCert: func(info *tls.ClientHelloInfo) ([]*tls.Certificate, error) {
+			serverGetCert: func(*tls.ClientHelloInfo) ([]*tls.Certificate, error) {
 				return []*tls.Certificate{&cs.ServerCert1}, nil
 			},
 			serverGetRoot:          getRootCertificatesForServer,
@@ -579,14 +641,14 @@ func (s) TestClientServerHandshake(t *testing.T) {
 		// certificate mismatch
 		{
 			desc: "Client sends wrong peer cert; Server sets reload peer/root function with verifyFuncGood; mutualTLS",
-			clientGetCert: func(info *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			clientGetCert: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
 				return &cs.ServerCert1, nil
 			},
 			clientGetRoot:          getRootCertificatesForClient,
 			clientVerifyFunc:       clientVerifyFuncGood,
 			clientVerificationType: CertVerification,
 			serverMutualTLS:        true,
-			serverGetCert: func(info *tls.ClientHelloInfo) ([]*tls.Certificate, error) {
+			serverGetCert: func(*tls.ClientHelloInfo) ([]*tls.Certificate, error) {
 				return []*tls.Certificate{&cs.ServerCert1}, nil
 			},
 			serverGetRoot:          getRootCertificatesForServer,
@@ -600,7 +662,7 @@ func (s) TestClientServerHandshake(t *testing.T) {
 		// certificate mismatch and handshake failure
 		{
 			desc: "Client has wrong trust cert; Server sets reload peer/root function with verifyFuncGood; mutualTLS",
-			clientGetCert: func(info *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			clientGetCert: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
 				return &cs.ClientCert1, nil
 			},
 			clientGetRoot:              getRootCertificatesForServer,
@@ -608,7 +670,7 @@ func (s) TestClientServerHandshake(t *testing.T) {
 			clientVerificationType:     CertVerification,
 			clientExpectHandshakeError: true,
 			serverMutualTLS:            true,
-			serverGetCert: func(info *tls.ClientHelloInfo) ([]*tls.Certificate, error) {
+			serverGetCert: func(*tls.ClientHelloInfo) ([]*tls.Certificate, error) {
 				return []*tls.Certificate{&cs.ServerCert1}, nil
 			},
 			serverGetRoot:          getRootCertificatesForServer,
@@ -623,14 +685,14 @@ func (s) TestClientServerHandshake(t *testing.T) {
 		// certificate mismatch and handshake failure
 		{
 			desc: "Client sets reload peer/root function with verifyFuncGood; Server sends wrong peer cert; mutualTLS",
-			clientGetCert: func(info *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			clientGetCert: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
 				return &cs.ClientCert1, nil
 			},
 			clientGetRoot:          getRootCertificatesForClient,
 			clientVerifyFunc:       clientVerifyFuncGood,
 			clientVerificationType: CertVerification,
 			serverMutualTLS:        true,
-			serverGetCert: func(info *tls.ClientHelloInfo) ([]*tls.Certificate, error) {
+			serverGetCert: func(*tls.ClientHelloInfo) ([]*tls.Certificate, error) {
 				return []*tls.Certificate{&cs.ClientCert1}, nil
 			},
 			serverGetRoot:          getRootCertificatesForServer,
@@ -644,7 +706,7 @@ func (s) TestClientServerHandshake(t *testing.T) {
 		// certificate mismatch and handshake failure
 		{
 			desc: "Client sets reload peer/root function with verifyFuncGood; Server has wrong trust cert; mutualTLS",
-			clientGetCert: func(info *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			clientGetCert: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
 				return &cs.ClientCert1, nil
 			},
 			clientGetRoot:              getRootCertificatesForClient,
@@ -652,7 +714,7 @@ func (s) TestClientServerHandshake(t *testing.T) {
 			clientVerificationType:     CertVerification,
 			clientExpectHandshakeError: true,
 			serverMutualTLS:            true,
-			serverGetCert: func(info *tls.ClientHelloInfo) ([]*tls.Certificate, error) {
+			serverGetCert: func(*tls.ClientHelloInfo) ([]*tls.Certificate, error) {
 				return []*tls.Certificate{&cs.ServerCert1}, nil
 			},
 			serverGetRoot:          getRootCertificatesForClient,
@@ -800,6 +862,78 @@ func (s) TestClientServerHandshake(t *testing.T) {
 			serverVerificationType:  CertVerification,
 			serverExpectError:       true,
 		},
+		{
+			desc:          "Client and server set CurvePreferences to CurveP256",
+			clientCert:    []tls.Certificate{cs.ClientCert1},
+			clientGetRoot: getRootCertificatesForClient,
+			clientVerifyFunc: func(params *HandshakeVerificationInfo) (*PostHandshakeVerificationResults, error) {
+				if params.ConnectionState.CurveID != tls.CurveP256 {
+					return nil, fmt.Errorf("client got CurveID %v, want %v", params.ConnectionState.CurveID, tls.CurveP256)
+				}
+				return &PostHandshakeVerificationResults{}, nil
+			},
+			clientVerificationType: CertVerification,
+			clientCurvePreferences: []tls.CurveID{tls.CurveP256},
+			serverMutualTLS:        true,
+			serverCert:             []tls.Certificate{cs.ServerCert1},
+			serverRoot:             cs.ServerTrust1,
+			serverVerifyFunc: func(params *HandshakeVerificationInfo) (*PostHandshakeVerificationResults, error) {
+				if params.ConnectionState.CurveID != tls.CurveP256 {
+					return nil, fmt.Errorf("server got CurveID %v, want %v", params.ConnectionState.CurveID, tls.CurveP256)
+				}
+				return &PostHandshakeVerificationResults{}, nil
+			},
+			serverVerificationType: CertVerification,
+			serverCurvePreferences: []tls.CurveID{tls.CurveP256},
+		},
+		{
+			desc:          "Client and server set CurvePreferences to X25519",
+			clientCert:    []tls.Certificate{cs.ClientCert1},
+			clientGetRoot: getRootCertificatesForClient,
+			clientVerifyFunc: func(params *HandshakeVerificationInfo) (*PostHandshakeVerificationResults, error) {
+				if params.ConnectionState.CurveID != tls.X25519 {
+					return nil, fmt.Errorf("client got CurveID %v, want %v", params.ConnectionState.CurveID, tls.X25519)
+				}
+				return &PostHandshakeVerificationResults{}, nil
+			},
+			clientVerificationType: CertVerification,
+			clientCurvePreferences: []tls.CurveID{tls.X25519},
+			serverMutualTLS:        true,
+			serverCert:             []tls.Certificate{cs.ServerCert1},
+			serverRoot:             cs.ServerTrust1,
+			serverVerifyFunc: func(params *HandshakeVerificationInfo) (*PostHandshakeVerificationResults, error) {
+				if params.ConnectionState.CurveID != tls.X25519 {
+					return nil, fmt.Errorf("server got CurveID %v, want %v", params.ConnectionState.CurveID, tls.X25519)
+				}
+				return &PostHandshakeVerificationResults{}, nil
+			},
+			serverVerificationType: CertVerification,
+			serverCurvePreferences: []tls.CurveID{tls.X25519},
+		},
+		{
+			desc:          "Client and server set CurvePreferences to X25519MLKEM768",
+			clientCert:    []tls.Certificate{cs.ClientCert1},
+			clientGetRoot: getRootCertificatesForClient,
+			clientVerifyFunc: func(params *HandshakeVerificationInfo) (*PostHandshakeVerificationResults, error) {
+				if params.ConnectionState.CurveID != tls.X25519MLKEM768 {
+					return nil, fmt.Errorf("client got CurveID %v, want %v", params.ConnectionState.CurveID, tls.X25519MLKEM768)
+				}
+				return &PostHandshakeVerificationResults{}, nil
+			},
+			clientVerificationType: CertVerification,
+			clientCurvePreferences: []tls.CurveID{tls.X25519MLKEM768},
+			serverMutualTLS:        true,
+			serverCert:             []tls.Certificate{cs.ServerCert1},
+			serverRoot:             cs.ServerTrust1,
+			serverVerifyFunc: func(params *HandshakeVerificationInfo) (*PostHandshakeVerificationResults, error) {
+				if params.ConnectionState.CurveID != tls.X25519MLKEM768 {
+					return nil, fmt.Errorf("server got CurveID %v, want %v", params.ConnectionState.CurveID, tls.X25519MLKEM768)
+				}
+				return &PostHandshakeVerificationResults{}, nil
+			},
+			serverVerificationType: CertVerification,
+			serverCurvePreferences: []tls.CurveID{tls.X25519MLKEM768},
+		},
 	} {
 		test := test
 		t.Run(test.desc, func(t *testing.T) {
@@ -824,6 +958,7 @@ func (s) TestClientServerHandshake(t *testing.T) {
 				AdditionalPeerVerification: test.serverVerifyFunc,
 				VerificationType:           test.serverVerificationType,
 				RevocationOptions:          test.serverRevocationOptions,
+				CurvePreferences:           test.serverCurvePreferences,
 			}
 			go func(done chan credentials.AuthInfo, lis net.Listener, serverOptions *Options) {
 				serverRawConn, err := lis.Accept()
@@ -867,13 +1002,15 @@ func (s) TestClientServerHandshake(t *testing.T) {
 				},
 				VerificationType:  test.clientVerificationType,
 				RevocationOptions: test.clientRevocationOptions,
+				CurvePreferences:  test.clientCurvePreferences,
 			}
 			clientTLS, err := NewClientCreds(clientOptions)
 			if err != nil {
 				t.Fatalf("NewClientCreds failed: %v", err)
 			}
-			_, clientAuthInfo, handshakeErr := clientTLS.ClientHandshake(context.Background(),
-				lisAddr, conn)
+			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+			defer cancel()
+			_, clientAuthInfo, handshakeErr := clientTLS.ClientHandshake(ctx, lisAddr, conn)
 			// wait until server sends serverAuthInfo or fails.
 			serverAuthInfo, ok := <-done
 			if !ok && test.serverExpectError {
@@ -906,7 +1043,7 @@ func (s) TestClientServerHandshake(t *testing.T) {
 					cert, _ := test.clientGetCert(&tls.CertificateRequestInfo{})
 					clientCert = cert
 				} else if test.clientIdentityProvider != nil {
-					km, _ := test.clientIdentityProvider.KeyMaterial(context.TODO())
+					km, _ := test.clientIdentityProvider.KeyMaterial(ctx)
 					clientCert = &km.Certs[0]
 				}
 				if !bytes.Equal((*serverVerifiedChains[0][0]).Raw, clientCert.Certificate[0]) {
@@ -920,7 +1057,7 @@ func (s) TestClientServerHandshake(t *testing.T) {
 					result, _ := test.serverGetRoot(&ConnectionInfo{})
 					serverRoot = result.TrustCerts
 				} else if test.serverRootProvider != nil {
-					km, _ := test.serverRootProvider.KeyMaterial(context.TODO())
+					km, _ := test.serverRootProvider.KeyMaterial(ctx)
 					serverRoot = km.Roots
 				}
 				serverVerifiedChainsCp := x509.NewCertPool()
@@ -941,7 +1078,7 @@ func (s) TestClientServerHandshake(t *testing.T) {
 					cert, _ := test.serverGetCert(&tls.ClientHelloInfo{})
 					serverCert = cert[0]
 				} else if test.serverIdentityProvider != nil {
-					km, _ := test.serverIdentityProvider.KeyMaterial(context.TODO())
+					km, _ := test.serverIdentityProvider.KeyMaterial(ctx)
 					serverCert = &km.Certs[0]
 				}
 				if !bytes.Equal((*clientVerifiedChains[0][0]).Raw, serverCert.Certificate[0]) {
@@ -955,7 +1092,7 @@ func (s) TestClientServerHandshake(t *testing.T) {
 					result, _ := test.clientGetRoot(&ConnectionInfo{})
 					clientRoot = result.TrustCerts
 				} else if test.clientRootProvider != nil {
-					km, _ := test.clientRootProvider.KeyMaterial(context.TODO())
+					km, _ := test.clientRootProvider.KeyMaterial(ctx)
 					clientRoot = km.Roots
 				}
 				clientVerifiedChainsCp := x509.NewCertPool()
@@ -1040,7 +1177,7 @@ func (s) TestGetCertificatesSNI(t *testing.T) {
 		t.Run(test.desc, func(t *testing.T) {
 			serverOptions := &Options{
 				IdentityOptions: IdentityCertificateOptions{
-					GetIdentityCertificatesForServer: func(info *tls.ClientHelloInfo) ([]*tls.Certificate, error) {
+					GetIdentityCertificatesForServer: func(*tls.ClientHelloInfo) ([]*tls.Certificate, error) {
 						return []*tls.Certificate{&cs.ServerCert1, &cs.ServerCert2, &cs.ServerPeer3}, nil
 					},
 				},
@@ -1073,6 +1210,114 @@ func (s) TestGetCertificatesSNI(t *testing.T) {
 			}
 			if parsedCert.Subject.CommonName != test.wantCommonName {
 				t.Errorf("Common name mismatch, got %v, want %v", parsedCert.Subject.CommonName, test.wantCommonName)
+			}
+		})
+	}
+}
+
+func (s) TestVerifyPeerCertificateZeroCerts(t *testing.T) {
+	creds := &advancedTLSCreds{
+		verificationType: CertVerification,
+		isClient:         true,
+		config:           &tls.Config{},
+	}
+	verifyPeerCertificate, _ := buildVerifyFunc(creds, "", nil, &CertificateChains{})
+	// Calling verifyPeerCertificate with zero certificates.
+	const wantErr = "no peer certificates presented"
+	if err := verifyPeerCertificate(nil, nil); err == nil || !strings.Contains(err.Error(), wantErr) {
+		t.Errorf("verifyPeerCertificate(nil, nil) = %v, want error containing %q", err, wantErr)
+	}
+}
+
+func (s) TestServerAuthEKUValidation(t *testing.T) {
+	// Generate server cert with ClientAuth EKU (no ServerAuth EKU)
+	rootPool, serverCert := generateCertificates(t, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
+
+	for _, test := range []struct {
+		desc              string
+		skipServerAuthEKU bool
+		wantErr           bool
+	}{
+		{
+			desc:              "SkipServerAuthEKU_False_HandshakeFails",
+			skipServerAuthEKU: false,
+			wantErr:           true,
+		},
+		{
+			desc:              "SkipServerAuthEKU_True_HandshakeSucceeds",
+			skipServerAuthEKU: true,
+			wantErr:           false,
+		},
+	} {
+		t.Run(test.desc, func(t *testing.T) {
+			lis, err := net.Listen("tcp", "localhost:0")
+			if err != nil {
+				t.Fatalf("Failed to listen: %v", err)
+			}
+			defer lis.Close()
+
+			serverOptions := &Options{
+				IdentityOptions: IdentityCertificateOptions{
+					Certificates: []tls.Certificate{serverCert},
+				},
+				VerificationType: CertVerification,
+			}
+			done := make(chan credentials.AuthInfo, 1)
+			go func() {
+				serverRawConn, err := lis.Accept()
+				if err != nil {
+					close(done)
+					return
+				}
+				serverTLS, err := NewServerCreds(serverOptions)
+				if err != nil {
+					serverRawConn.Close()
+					close(done)
+					return
+				}
+				_, serverAuthInfo, err := serverTLS.ServerHandshake(serverRawConn)
+				if err != nil {
+					serverRawConn.Close()
+					close(done)
+					return
+				}
+				done <- serverAuthInfo
+			}()
+
+			lisAddr := lis.Addr().String()
+			conn, err := net.Dial("tcp", lisAddr)
+			if err != nil {
+				t.Fatalf("Client failed to connect to %s. Error: %v", lisAddr, err)
+			}
+			defer conn.Close()
+
+			clientOptions := &Options{
+				RootOptions: RootCertificateOptions{
+					RootCertificates: rootPool,
+				},
+				VerificationType:  CertVerification,
+				SkipServerAuthEKU: test.skipServerAuthEKU,
+			}
+			clientTLS, err := NewClientCreds(clientOptions)
+			if err != nil {
+				t.Fatalf("NewClientCreds failed: %v", err)
+			}
+			// Clone the credentials to ensure the cloned instance also respects SkipServerAuthEKU
+			clientTLS = clientTLS.Clone()
+			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+			defer cancel()
+			_, _, handshakeErr := clientTLS.ClientHandshake(ctx, lisAddr, conn)
+
+			// wait for server side to finish
+			select {
+			case <-done:
+			case <-time.After(defaultTestTimeout):
+				t.Fatalf("timed out waiting for server handshake to finish")
+			}
+
+			gotErr := handshakeErr != nil
+			if gotErr != test.wantErr {
+				t.Fatalf("ClientHandshake() got error: %v, want error: %v", handshakeErr, test.wantErr)
 			}
 		})
 	}

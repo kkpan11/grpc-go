@@ -16,7 +16,8 @@
  *
  */
 
-// Binary client is an example client.
+// Binary client demonstrates how to use custom name resolvers to resolve
+// server backend addresses.
 package main
 
 import (
@@ -97,7 +98,7 @@ func main() {
 // ResolverBuilder(https://godoc.org/google.golang.org/grpc/resolver#Builder).
 type exampleResolverBuilder struct{}
 
-func (*exampleResolverBuilder) Build(target resolver.Target, cc resolver.ClientConn, opts resolver.BuildOptions) (resolver.Resolver, error) {
+func (*exampleResolverBuilder) Build(target resolver.Target, cc resolver.ClientConn, _ resolver.BuildOptions) (resolver.Resolver, error) {
 	r := &exampleResolver{
 		target: target,
 		cc:     cc,
@@ -126,8 +127,8 @@ func (r *exampleResolver) start() {
 	}
 	r.cc.UpdateState(resolver.State{Addresses: addrs})
 }
-func (*exampleResolver) ResolveNow(o resolver.ResolveNowOptions) {}
-func (*exampleResolver) Close()                                  {}
+func (*exampleResolver) ResolveNow(resolver.ResolveNowOptions) {}
+func (*exampleResolver) Close()                                {}
 
 func init() {
 	// Register the example ResolverBuilder. This is usually done in a package's

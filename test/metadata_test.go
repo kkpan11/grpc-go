@@ -37,7 +37,7 @@ import (
 )
 
 func (s) TestInvalidMetadata(t *testing.T) {
-	grpctest.TLogger.ExpectErrorN("stream: failed to validate md when setting trailer", 5)
+	grpctest.ExpectErrorN("stream: failed to validate md when setting trailer", 5)
 
 	tests := []struct {
 		name     string
@@ -94,7 +94,7 @@ func (s) TestInvalidMetadata(t *testing.T) {
 
 	testNum := 0
 	ss := &stubserver.StubServer{
-		EmptyCallF: func(ctx context.Context, in *testpb.Empty) (*testpb.Empty, error) {
+		EmptyCallF: func(context.Context, *testpb.Empty) (*testpb.Empty, error) {
 			return &testpb.Empty{}, nil
 		},
 		FullDuplexCallF: func(stream testgrpc.TestService_FullDuplexCallServer) error {

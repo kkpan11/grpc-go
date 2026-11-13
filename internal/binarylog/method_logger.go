@@ -106,7 +106,7 @@ func (ml *TruncatingMethodLogger) Build(c LogEntryConfig) *binlogpb.GrpcLogEntry
 }
 
 // Log creates a proto binary log entry, and logs it to the sink.
-func (ml *TruncatingMethodLogger) Log(ctx context.Context, c LogEntryConfig) {
+func (ml *TruncatingMethodLogger) Log(_ context.Context, c LogEntryConfig) {
 	ml.sink.Write(ml.Build(c))
 }
 
@@ -395,7 +395,7 @@ func (c *Cancel) toProto() *binlogpb.GrpcLogEntry {
 // omitted.
 func metadataKeyOmit(key string) bool {
 	switch key {
-	case "lb-token", ":path", ":authority", "content-encoding", "content-type", "user-agent", "te":
+	case "lb-token", ":path", ":authority", "content-encoding", "content-type", "user-agent", "te", "authorization":
 		return true
 	case "grpc-trace-bin": // grpc-trace-bin is special because it's visible to users.
 		return false

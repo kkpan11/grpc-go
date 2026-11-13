@@ -29,13 +29,19 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/balancer"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/internal"
 	"google.golang.org/grpc/internal/balancer/stub"
 	"google.golang.org/grpc/internal/channelz"
+	"google.golang.org/grpc/internal/testutils"
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/resolver/manual"
+	"google.golang.org/grpc/status"
+
+	testgrpc "google.golang.org/grpc/interop/grpc_testing"
+	testpb "google.golang.org/grpc/interop/grpc_testing"
 )
 
 // TestResolverBalancerInteraction tests:
@@ -45,10 +51,9 @@ import (
 // 4. balancer.ClientConn.ResolveNow() ->
 // 5. resolver.Resolver.ResolveNow() ->
 func (s) TestResolverBalancerInteraction(t *testing.T) {
-	name := strings.Replace(strings.ToLower(t.Name()), "/", "", -1)
-	fmt.Println(name)
+	name := strings.ReplaceAll(strings.ToLower(t.Name()), "/", "")
 	bf := stub.BalancerFuncs{
-		UpdateClientConnState: func(bd *stub.BalancerData, ccs balancer.ClientConnState) error {
+		UpdateClientConnState: func(bd *stub.BalancerData, _ balancer.ClientConnState) error {
 			bd.ClientConn.ResolveNow(resolver.ResolveNowOptions{})
 			return nil
 		},
@@ -67,11 +72,12 @@ func (s) TestResolverBalancerInteraction(t *testing.T) {
 	rb.ResolveNowCallback = func(resolver.ResolveNowOptions) { close(rnCh) }
 	resolver.Register(rb)
 
-	cc, err := grpc.Dial(name+":///", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	cc, err := grpc.NewClient(name+":///", grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		t.Fatalf("grpc.Dial error: %v", err)
+		t.Fatalf("grpc.NewClient error: %v", err)
 	}
 	defer cc.Close()
+	cc.Connect()
 	select {
 	case <-rnCh:
 	case <-time.After(defaultTestTimeout):
@@ -85,7 +91,7 @@ type resolverBuilderWithErr struct {
 	scheme string
 }
 
-func (b *resolverBuilderWithErr) Build(_ resolver.Target, cc resolver.ClientConn, _ resolver.BuildOptions) (resolver.Resolver, error) {
+func (b *resolverBuilderWithErr) Build(_ resolver.Target, _ resolver.ClientConn, _ resolver.BuildOptions) (resolver.Resolver, error) {
 	if err := <-b.errCh; err != nil {
 		return nil, err
 	}
@@ -105,16 +111,17 @@ func (b *resolverBuilderWithErr) Close() {}
 // 4. resolver.Builder.Build() fails.
 func (s) TestResolverBuildFailure(t *testing.T) {
 	enterIdle := internal.EnterIdleModeForTesting.(func(*grpc.ClientConn))
-	name := strings.Replace(strings.ToLower(t.Name()), "/", "", -1)
+	name := strings.ReplaceAll(strings.ToLower(t.Name()), "/", "")
 	resErrCh := make(chan error, 1)
 	resolver.Register(&resolverBuilderWithErr{errCh: resErrCh, scheme: name})
 
 	resErrCh <- nil
-	cc, err := grpc.Dial(name+":///", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	cc, err := grpc.NewClient(name+":///", grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		t.Fatalf("grpc.Dial error: %v", err)
+		t.Fatalf("grpc.NewClient error: %v", err)
 	}
 	defer cc.Close()
+	cc.Connect()
 	enterIdle(cc)
 	const errStr = "test error from resolver builder"
 	t.Log("pushing res err")
@@ -126,12 +133,46 @@ func (s) TestResolverBuildFailure(t *testing.T) {
 	}
 }
 
+// Tests the case where the resolver reports an error to the channel before
+// reporting an update. Verifies that the channel eventually moves to
+// TransientFailure and subsequent RPCs returns the error reported by the
+// resolver to the user.
+func (s) TestResolverReportError(t *testing.T) {
+	const resolverErr = "test resolver error"
+	r := manual.NewBuilderWithScheme("whatever")
+	r.BuildCallback = func(_ resolver.Target, cc resolver.ClientConn, _ resolver.BuildOptions) {
+		cc.ReportError(errors.New(resolverErr))
+	}
+
+	cc, err := grpc.NewClient(r.Scheme()+":///", grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithResolvers(r))
+	if err != nil {
+		t.Fatalf("Error creating client: %v", err)
+	}
+	defer cc.Close()
+	cc.Connect()
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	testutils.AwaitState(ctx, t, cc, connectivity.TransientFailure)
+
+	client := testgrpc.NewTestServiceClient(cc)
+	for range 5 {
+		_, err = client.EmptyCall(ctx, &testpb.Empty{})
+		if code := status.Code(err); code != codes.Unavailable {
+			t.Fatalf("EmptyCall() = %v, want %v", err, codes.Unavailable)
+		}
+		if err == nil || !strings.Contains(err.Error(), resolverErr) {
+			t.Fatalf("EmptyCall() = %q, want %q", err, resolverErr)
+		}
+	}
+}
+
 // TestEnterIdleDuringResolverUpdateState tests a scenario that used to deadlock
 // while calling UpdateState at the same time as the resolver being closed while
 // the channel enters idle mode.
 func (s) TestEnterIdleDuringResolverUpdateState(t *testing.T) {
 	enterIdle := internal.EnterIdleModeForTesting.(func(*grpc.ClientConn))
-	name := strings.Replace(strings.ToLower(t.Name()), "/", "", -1)
+	name := strings.ReplaceAll(strings.ToLower(t.Name()), "/", "")
 
 	// Create a manual resolver that spams UpdateState calls until it is closed.
 	rb := manual.NewBuilderWithScheme(name)
@@ -176,12 +217,12 @@ func (s) TestEnterIdleDuringResolverUpdateState(t *testing.T) {
 // time as the balancer being closed while the channel enters idle mode.
 func (s) TestEnterIdleDuringBalancerUpdateState(t *testing.T) {
 	enterIdle := internal.EnterIdleModeForTesting.(func(*grpc.ClientConn))
-	name := strings.Replace(strings.ToLower(t.Name()), "/", "", -1)
+	name := strings.ReplaceAll(strings.ToLower(t.Name()), "/", "")
 
 	// Create a balancer that calls UpdateState once asynchronously, attempting
 	// to make the channel appear ready even after entering idle.
 	bf := stub.BalancerFuncs{
-		UpdateClientConnState: func(bd *stub.BalancerData, ccs balancer.ClientConnState) error {
+		UpdateClientConnState: func(bd *stub.BalancerData, _ balancer.ClientConnState) error {
 			go func() {
 				bd.ClientConn.UpdateState(balancer.State{ConnectivityState: connectivity.Ready})
 			}()
@@ -221,12 +262,12 @@ func (s) TestEnterIdleDuringBalancerNewSubConn(t *testing.T) {
 	channelz.TurnOn()
 	defer internal.ChannelzTurnOffForTesting()
 	enterIdle := internal.EnterIdleModeForTesting.(func(*grpc.ClientConn))
-	name := strings.Replace(strings.ToLower(t.Name()), "/", "", -1)
+	name := strings.ReplaceAll(strings.ToLower(t.Name()), "/", "")
 
 	// Create a balancer that calls NewSubConn once asynchronously, attempting
 	// to create a subchannel after going idle.
 	bf := stub.BalancerFuncs{
-		UpdateClientConnState: func(bd *stub.BalancerData, ccs balancer.ClientConnState) error {
+		UpdateClientConnState: func(bd *stub.BalancerData, _ balancer.ClientConnState) error {
 			go func() {
 				bd.ClientConn.NewSubConn([]resolver.Address{{Addr: "test"}}, balancer.NewSubConnOptions{})
 			}()

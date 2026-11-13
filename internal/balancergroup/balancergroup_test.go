@@ -14,12 +14,14 @@
  * limitations under the License.
  */
 
-package balancergroup
+package balancergroup_test
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -30,6 +32,7 @@ import (
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/internal/balancer/stub"
+	"google.golang.org/grpc/internal/balancergroup"
 	"google.golang.org/grpc/internal/channelz"
 	"google.golang.org/grpc/internal/grpctest"
 	"google.golang.org/grpc/internal/testutils"
@@ -38,20 +41,23 @@ import (
 
 const (
 	defaultTestTimeout      = 5 * time.Second
-	defaultTestShortTimeout = 10 * time.Millisecond
+	defaultTestShortTimeout = 100 * time.Millisecond
 )
 
 var (
-	rrBuilder        = balancer.Get(roundrobin.Name)
-	testBalancerIDs  = []string{"b1", "b2", "b3"}
-	testBackendAddrs []resolver.Address
+	rrBuilder            = balancer.Get(roundrobin.Name)
+	testBalancerIDs      = []string{"b1", "b2", "b3"}
+	testBackendAddrs     []resolver.Address
+	testBackendEndpoints []resolver.Endpoint
 )
 
 const testBackendAddrsCount = 12
 
 func init() {
 	for i := 0; i < testBackendAddrsCount; i++ {
-		testBackendAddrs = append(testBackendAddrs, resolver.Address{Addr: fmt.Sprintf("%d.%d.%d.%d:%d", i, i, i, i, i)})
+		addr := resolver.Address{Addr: fmt.Sprintf("%d.%d.%d.%d:%d", i, i, i, i, i)}
+		testBackendAddrs = append(testBackendAddrs, addr)
+		testBackendEndpoints = append(testBackendEndpoints, resolver.Endpoint{Addresses: []resolver.Address{addr}})
 	}
 }
 
@@ -63,20 +69,17 @@ func Test(t *testing.T) {
 	grpctest.RunSubTests(t, s{})
 }
 
-// Create a new balancer group, add balancer and backends, but not start.
+// Create a new balancer group, add balancer and backends.
 // - b1, weight 2, backends [0,1]
 // - b2, weight 1, backends [2,3]
 // Start the balancer group and check behavior.
 //
-// Close the balancer group, call add/remove/change weight/change address.
-// - b2, weight 3, backends [0,3]
-// - b3, weight 1, backends [1,2]
-// Start the balancer group again and check for behavior.
+// Close the balancer group.
 func (s) TestBalancerGroup_start_close(t *testing.T) {
 	cc := testutils.NewBalancerClientConn(t)
 	gator := weightedaggregator.New(cc, nil, testutils.NewTestWRR)
 	gator.Start()
-	bg := New(Options{
+	bg := balancergroup.New(balancergroup.Options{
 		CC:                      cc,
 		BuildOpts:               balancer.BuildOptions{},
 		StateAggregator:         gator,
@@ -88,18 +91,16 @@ func (s) TestBalancerGroup_start_close(t *testing.T) {
 	// balancers.
 	gator.Add(testBalancerIDs[0], 2)
 	bg.Add(testBalancerIDs[0], rrBuilder)
-	bg.UpdateClientConnState(testBalancerIDs[0], balancer.ClientConnState{ResolverState: resolver.State{Addresses: testBackendAddrs[0:2]}})
+	bg.UpdateClientConnState(testBalancerIDs[0], balancer.ClientConnState{ResolverState: resolver.State{Endpoints: testBackendEndpoints[0:2]}})
 	gator.Add(testBalancerIDs[1], 1)
 	bg.Add(testBalancerIDs[1], rrBuilder)
-	bg.UpdateClientConnState(testBalancerIDs[1], balancer.ClientConnState{ResolverState: resolver.State{Addresses: testBackendAddrs[2:4]}})
+	bg.UpdateClientConnState(testBalancerIDs[1], balancer.ClientConnState{ResolverState: resolver.State{Endpoints: testBackendEndpoints[2:4]}})
 
-	bg.Start()
-
-	m1 := make(map[resolver.Address]balancer.SubConn)
+	m1 := make(map[string]balancer.SubConn)
 	for i := 0; i < 4; i++ {
 		addrs := <-cc.NewSubConnAddrsCh
 		sc := <-cc.NewSubConnCh
-		m1[addrs[0]] = sc
+		m1[addrs[0].Addr] = sc
 		sc.UpdateState(balancer.SubConnState{ConnectivityState: connectivity.Connecting})
 		sc.UpdateState(balancer.SubConnState{ConnectivityState: connectivity.Ready})
 	}
@@ -107,9 +108,9 @@ func (s) TestBalancerGroup_start_close(t *testing.T) {
 	// Test roundrobin on the last picker.
 	p1 := <-cc.NewPickerCh
 	want := []balancer.SubConn{
-		m1[testBackendAddrs[0]], m1[testBackendAddrs[0]],
-		m1[testBackendAddrs[1]], m1[testBackendAddrs[1]],
-		m1[testBackendAddrs[2]], m1[testBackendAddrs[3]],
+		m1[testBackendAddrs[0].Addr], m1[testBackendAddrs[0].Addr],
+		m1[testBackendAddrs[1].Addr], m1[testBackendAddrs[1].Addr],
+		m1[testBackendAddrs[2].Addr], m1[testBackendAddrs[3].Addr],
 	}
 	if err := testutils.IsRoundRobin(want, testutils.SubConnFromPicker(p1)); err != nil {
 		t.Fatalf("want %v, got %v", want, err)
@@ -120,42 +121,6 @@ func (s) TestBalancerGroup_start_close(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		(<-cc.ShutdownSubConnCh).UpdateState(balancer.SubConnState{ConnectivityState: connectivity.Shutdown})
 	}
-
-	// Add b3, weight 1, backends [1,2].
-	gator.Add(testBalancerIDs[2], 1)
-	bg.Add(testBalancerIDs[2], rrBuilder)
-	bg.UpdateClientConnState(testBalancerIDs[2], balancer.ClientConnState{ResolverState: resolver.State{Addresses: testBackendAddrs[1:3]}})
-
-	// Remove b1.
-	gator.Remove(testBalancerIDs[0])
-	bg.Remove(testBalancerIDs[0])
-
-	// Update b2 to weight 3, backends [0,3].
-	gator.UpdateWeight(testBalancerIDs[1], 3)
-	bg.UpdateClientConnState(testBalancerIDs[1], balancer.ClientConnState{ResolverState: resolver.State{Addresses: append([]resolver.Address(nil), testBackendAddrs[0], testBackendAddrs[3])}})
-
-	gator.Start()
-	bg.Start()
-
-	m2 := make(map[resolver.Address]balancer.SubConn)
-	for i := 0; i < 4; i++ {
-		addrs := <-cc.NewSubConnAddrsCh
-		sc := <-cc.NewSubConnCh
-		m2[addrs[0]] = sc
-		sc.UpdateState(balancer.SubConnState{ConnectivityState: connectivity.Connecting})
-		sc.UpdateState(balancer.SubConnState{ConnectivityState: connectivity.Ready})
-	}
-
-	// Test roundrobin on the last picker.
-	p2 := <-cc.NewPickerCh
-	want = []balancer.SubConn{
-		m2[testBackendAddrs[0]], m2[testBackendAddrs[0]], m2[testBackendAddrs[0]],
-		m2[testBackendAddrs[3]], m2[testBackendAddrs[3]], m2[testBackendAddrs[3]],
-		m2[testBackendAddrs[1]], m2[testBackendAddrs[2]],
-	}
-	if err := testutils.IsRoundRobin(want, testutils.SubConnFromPicker(p2)); err != nil {
-		t.Fatalf("want %v, got %v", want, err)
-	}
 }
 
 // Test that balancer group start() doesn't deadlock if the balancer calls back
@@ -165,10 +130,10 @@ func (s) TestBalancerGroup_start_close(t *testing.T) {
 //   - hold a lock and send updates to balancer (e.g. update resolved addresses)
 //   - the balancer calls back (NewSubConn or update picker) in line
 //
-// The callback will try to hold hte same lock again, which will cause a
+// The callback will try to hold the same lock again, which will cause a
 // deadlock.
 //
-// This test starts the balancer group with a test balancer, will updates picker
+// This test starts the balancer group with a test balancer, will update picker
 // whenever it gets an address update. It's expected that start() doesn't block
 // because of deadlock.
 func (s) TestBalancerGroup_start_close_deadlock(t *testing.T) {
@@ -179,7 +144,7 @@ func (s) TestBalancerGroup_start_close_deadlock(t *testing.T) {
 	cc := testutils.NewBalancerClientConn(t)
 	gator := weightedaggregator.New(cc, nil, testutils.NewTestWRR)
 	gator.Start()
-	bg := New(Options{
+	bg := balancergroup.New(balancergroup.Options{
 		CC:                      cc,
 		BuildOpts:               balancer.BuildOptions{},
 		StateAggregator:         gator,
@@ -193,8 +158,6 @@ func (s) TestBalancerGroup_start_close_deadlock(t *testing.T) {
 	gator.Add(testBalancerIDs[1], 1)
 	bg.Add(testBalancerIDs[1], builder)
 	bg.UpdateClientConnState(testBalancerIDs[1], balancer.ClientConnState{ResolverState: resolver.State{Addresses: testBackendAddrs[2:4]}})
-
-	bg.Start()
 }
 
 // initBalancerGroupForCachingTest creates a balancer group, and initialize it
@@ -203,11 +166,11 @@ func (s) TestBalancerGroup_start_close_deadlock(t *testing.T) {
 // Two rr balancers are added to bg, each with 2 ready subConns. A sub-balancer
 // is removed later, so the balancer group returned has one sub-balancer in its
 // own map, and one sub-balancer in cache.
-func initBalancerGroupForCachingTest(t *testing.T, idleCacheTimeout time.Duration) (*weightedaggregator.Aggregator, *BalancerGroup, *testutils.BalancerClientConn, map[resolver.Address]*testutils.TestSubConn) {
+func initBalancerGroupForCachingTest(t *testing.T, idleCacheTimeout time.Duration) (*weightedaggregator.Aggregator, *balancergroup.BalancerGroup, *testutils.BalancerClientConn, map[string]*testutils.TestSubConn) {
 	cc := testutils.NewBalancerClientConn(t)
 	gator := weightedaggregator.New(cc, nil, testutils.NewTestWRR)
 	gator.Start()
-	bg := New(Options{
+	bg := balancergroup.New(balancergroup.Options{
 		CC:                      cc,
 		BuildOpts:               balancer.BuildOptions{},
 		StateAggregator:         gator,
@@ -219,18 +182,16 @@ func initBalancerGroupForCachingTest(t *testing.T, idleCacheTimeout time.Duratio
 	// balancers.
 	gator.Add(testBalancerIDs[0], 2)
 	bg.Add(testBalancerIDs[0], rrBuilder)
-	bg.UpdateClientConnState(testBalancerIDs[0], balancer.ClientConnState{ResolverState: resolver.State{Addresses: testBackendAddrs[0:2]}})
+	bg.UpdateClientConnState(testBalancerIDs[0], balancer.ClientConnState{ResolverState: resolver.State{Endpoints: testBackendEndpoints[0:2]}})
 	gator.Add(testBalancerIDs[1], 1)
 	bg.Add(testBalancerIDs[1], rrBuilder)
-	bg.UpdateClientConnState(testBalancerIDs[1], balancer.ClientConnState{ResolverState: resolver.State{Addresses: testBackendAddrs[2:4]}})
+	bg.UpdateClientConnState(testBalancerIDs[1], balancer.ClientConnState{ResolverState: resolver.State{Endpoints: testBackendEndpoints[2:4]}})
 
-	bg.Start()
-
-	m1 := make(map[resolver.Address]*testutils.TestSubConn)
+	m1 := make(map[string]*testutils.TestSubConn)
 	for i := 0; i < 4; i++ {
 		addrs := <-cc.NewSubConnAddrsCh
 		sc := <-cc.NewSubConnCh
-		m1[addrs[0]] = sc
+		m1[addrs[0].Addr] = sc
 		sc.UpdateState(balancer.SubConnState{ConnectivityState: connectivity.Connecting})
 		sc.UpdateState(balancer.SubConnState{ConnectivityState: connectivity.Ready})
 	}
@@ -238,9 +199,9 @@ func initBalancerGroupForCachingTest(t *testing.T, idleCacheTimeout time.Duratio
 	// Test roundrobin on the last picker.
 	p1 := <-cc.NewPickerCh
 	want := []balancer.SubConn{
-		m1[testBackendAddrs[0]], m1[testBackendAddrs[0]],
-		m1[testBackendAddrs[1]], m1[testBackendAddrs[1]],
-		m1[testBackendAddrs[2]], m1[testBackendAddrs[3]],
+		m1[testBackendAddrs[0].Addr], m1[testBackendAddrs[0].Addr],
+		m1[testBackendAddrs[1].Addr], m1[testBackendAddrs[1].Addr],
+		m1[testBackendAddrs[2].Addr], m1[testBackendAddrs[3].Addr],
 	}
 	if err := testutils.IsRoundRobin(want, testutils.SubConnFromPicker(p1)); err != nil {
 		t.Fatalf("want %v, got %v", want, err)
@@ -261,7 +222,7 @@ func initBalancerGroupForCachingTest(t *testing.T, idleCacheTimeout time.Duratio
 	// Test roundrobin on the with only sub-balancer0.
 	p2 := <-cc.NewPickerCh
 	want = []balancer.SubConn{
-		m1[testBackendAddrs[0]], m1[testBackendAddrs[1]],
+		m1[testBackendAddrs[0].Addr], m1[testBackendAddrs[1].Addr],
 	}
 	if err := testutils.IsRoundRobin(want, testutils.SubConnFromPicker(p2)); err != nil {
 		t.Fatalf("want %v, got %v", want, err)
@@ -277,7 +238,10 @@ func (s) TestBalancerGroup_locality_caching(t *testing.T) {
 
 	// Turn down subconn for addr2, shouldn't get picker update because
 	// sub-balancer1 was removed.
-	addrToSC[testBackendAddrs[2]].UpdateState(balancer.SubConnState{ConnectivityState: connectivity.TransientFailure})
+	addrToSC[testBackendAddrs[2].Addr].UpdateState(balancer.SubConnState{
+		ConnectivityState: connectivity.TransientFailure,
+		ConnectionError:   errors.New("test error"),
+	})
 	for i := 0; i < 10; i++ {
 		select {
 		case <-cc.NewPickerCh:
@@ -295,10 +259,10 @@ func (s) TestBalancerGroup_locality_caching(t *testing.T) {
 
 	p3 := <-cc.NewPickerCh
 	want := []balancer.SubConn{
-		addrToSC[testBackendAddrs[0]], addrToSC[testBackendAddrs[0]],
-		addrToSC[testBackendAddrs[1]], addrToSC[testBackendAddrs[1]],
+		addrToSC[testBackendAddrs[0].Addr], addrToSC[testBackendAddrs[0].Addr],
+		addrToSC[testBackendAddrs[1].Addr], addrToSC[testBackendAddrs[1].Addr],
 		// addr2 is down, b2 only has addr3 in READY state.
-		addrToSC[testBackendAddrs[3]], addrToSC[testBackendAddrs[3]],
+		addrToSC[testBackendAddrs[3].Addr], addrToSC[testBackendAddrs[3].Addr],
 	}
 	if err := testutils.IsRoundRobin(want, testutils.SubConnFromPicker(p3)); err != nil {
 		t.Fatalf("want %v, got %v", want, err)
@@ -324,10 +288,10 @@ func (s) TestBalancerGroup_locality_caching_close_group(t *testing.T) {
 	// The balancer group is closed. The subconns should be shutdown immediately.
 	shutdownTimeout := time.After(time.Millisecond * 500)
 	scToShutdown := map[balancer.SubConn]int{
-		addrToSC[testBackendAddrs[0]]: 1,
-		addrToSC[testBackendAddrs[1]]: 1,
-		addrToSC[testBackendAddrs[2]]: 1,
-		addrToSC[testBackendAddrs[3]]: 1,
+		addrToSC[testBackendAddrs[0].Addr]: 1,
+		addrToSC[testBackendAddrs[1].Addr]: 1,
+		addrToSC[testBackendAddrs[2].Addr]: 1,
+		addrToSC[testBackendAddrs[3].Addr]: 1,
 	}
 	for i := 0; i < len(scToShutdown); i++ {
 		select {
@@ -345,7 +309,7 @@ func (s) TestBalancerGroup_locality_caching_close_group(t *testing.T) {
 
 // Sub-balancers in cache will be closed if not re-added within timeout, and
 // subConns will be shut down.
-func (s) TestBalancerGroup_locality_caching_not_readd_within_timeout(t *testing.T) {
+func (s) TestBalancerGroup_locality_caching_not_read_within_timeout(t *testing.T) {
 	_, _, cc, addrToSC := initBalancerGroupForCachingTest(t, time.Second)
 
 	// The sub-balancer is not re-added within timeout. The subconns should be
@@ -353,8 +317,8 @@ func (s) TestBalancerGroup_locality_caching_not_readd_within_timeout(t *testing.
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
 	scToShutdown := map[balancer.SubConn]int{
-		addrToSC[testBackendAddrs[2]]: 1,
-		addrToSC[testBackendAddrs[3]]: 1,
+		addrToSC[testBackendAddrs[2].Addr]: 1,
+		addrToSC[testBackendAddrs[3].Addr]: 1,
 	}
 	for i := 0; i < len(scToShutdown); i++ {
 		select {
@@ -385,7 +349,7 @@ func (*noopBalancerBuilderWrapper) Name() string {
 
 // After removing a sub-balancer, re-add with same ID, but different balancer
 // builder. Old subconns should be shut down, and new subconns should be created.
-func (s) TestBalancerGroup_locality_caching_readd_with_different_builder(t *testing.T) {
+func (s) TestBalancerGroup_locality_caching_read_with_different_builder(t *testing.T) {
 	gator, bg, cc, addrToSC := initBalancerGroupForCachingTest(t, defaultTestTimeout)
 
 	// Re-add sub-balancer-1, but with a different balancer builder. The
@@ -399,8 +363,8 @@ func (s) TestBalancerGroup_locality_caching_readd_with_different_builder(t *test
 	// shut down immediately.
 	shutdownTimeout := time.After(time.Millisecond * 500)
 	scToShutdown := map[balancer.SubConn]int{
-		addrToSC[testBackendAddrs[2]]: 1,
-		addrToSC[testBackendAddrs[3]]: 1,
+		addrToSC[testBackendAddrs[2].Addr]: 1,
+		addrToSC[testBackendAddrs[3].Addr]: 1,
 	}
 	for i := 0; i < len(scToShutdown); i++ {
 		select {
@@ -415,23 +379,23 @@ func (s) TestBalancerGroup_locality_caching_readd_with_different_builder(t *test
 		}
 	}
 
-	bg.UpdateClientConnState(testBalancerIDs[1], balancer.ClientConnState{ResolverState: resolver.State{Addresses: testBackendAddrs[4:6]}})
+	bg.UpdateClientConnState(testBalancerIDs[1], balancer.ClientConnState{ResolverState: resolver.State{Endpoints: testBackendEndpoints[4:6]}})
 
 	newSCTimeout := time.After(time.Millisecond * 500)
-	scToAdd := map[resolver.Address]int{
-		testBackendAddrs[4]: 1,
-		testBackendAddrs[5]: 1,
+	scToAdd := map[string]int{
+		testBackendAddrs[4].Addr: 1,
+		testBackendAddrs[5].Addr: 1,
 	}
 	for i := 0; i < len(scToAdd); i++ {
 		select {
 		case addr := <-cc.NewSubConnAddrsCh:
-			c := scToAdd[addr[0]]
+			c := scToAdd[addr[0].Addr]
 			if c == 0 {
 				t.Fatalf("Got newSubConn for %v when there's %d new expected", addr, c)
 			}
-			scToAdd[addr[0]] = c - 1
+			scToAdd[addr[0].Addr] = c - 1
 			sc := <-cc.NewSubConnCh
-			addrToSC[addr[0]] = sc
+			addrToSC[addr[0].Addr] = sc
 			sc.UpdateState(balancer.SubConnState{ConnectivityState: connectivity.Connecting})
 			sc.UpdateState(balancer.SubConnState{ConnectivityState: connectivity.Ready})
 		case <-newSCTimeout:
@@ -442,9 +406,9 @@ func (s) TestBalancerGroup_locality_caching_readd_with_different_builder(t *test
 	// Test roundrobin on the new picker.
 	p3 := <-cc.NewPickerCh
 	want := []balancer.SubConn{
-		addrToSC[testBackendAddrs[0]], addrToSC[testBackendAddrs[0]],
-		addrToSC[testBackendAddrs[1]], addrToSC[testBackendAddrs[1]],
-		addrToSC[testBackendAddrs[4]], addrToSC[testBackendAddrs[5]],
+		addrToSC[testBackendAddrs[0].Addr], addrToSC[testBackendAddrs[0].Addr],
+		addrToSC[testBackendAddrs[1].Addr], addrToSC[testBackendAddrs[1].Addr],
+		addrToSC[testBackendAddrs[4].Addr], addrToSC[testBackendAddrs[5].Addr],
 	}
 	if err := testutils.IsRoundRobin(want, testutils.SubConnFromPicker(p3)); err != nil {
 		t.Fatalf("want %v, got %v", want, err)
@@ -504,13 +468,12 @@ func (s) TestBalancerGroupBuildOptions(t *testing.T) {
 		},
 	})
 	cc := testutils.NewBalancerClientConn(t)
-	bg := New(Options{
+	bg := balancergroup.New(balancergroup.Options{
 		CC:              cc,
 		BuildOpts:       bOpts,
 		StateAggregator: nil,
 		Logger:          nil,
 	})
-	bg.Start()
 
 	// Add the stub balancer build above as a child policy.
 	balancerBuilder := balancer.Get(balancerName)
@@ -523,6 +486,67 @@ func (s) TestBalancerGroupBuildOptions(t *testing.T) {
 	}
 }
 
+func (s) TestBalancerGroup_UpdateClientConnState_AfterClose(t *testing.T) {
+	balancerName := t.Name()
+	clientConnStateCh := make(chan struct{}, 1)
+
+	stub.Register(balancerName, stub.BalancerFuncs{
+		UpdateClientConnState: func(_ *stub.BalancerData, _ balancer.ClientConnState) error {
+			clientConnStateCh <- struct{}{}
+			return nil
+		},
+	})
+
+	bg := balancergroup.New(balancergroup.Options{
+		CC:              testutils.NewBalancerClientConn(t),
+		BuildOpts:       balancer.BuildOptions{},
+		StateAggregator: nil,
+		Logger:          nil,
+	})
+
+	bg.Add(testBalancerIDs[0], balancer.Get(balancerName))
+	bg.Close()
+
+	if err := bg.UpdateClientConnState(testBalancerIDs[0], balancer.ClientConnState{}); err != nil {
+		t.Fatalf("Expected nil error, got %v", err)
+	}
+
+	select {
+	case <-clientConnStateCh:
+		t.Fatalf("UpdateClientConnState was called after BalancerGroup was closed")
+	case <-time.After(defaultTestShortTimeout):
+	}
+}
+
+func (s) TestBalancerGroup_ResolverError_AfterClose(t *testing.T) {
+	balancerName := t.Name()
+	resolveErrorCh := make(chan struct{}, 1)
+
+	stub.Register(balancerName, stub.BalancerFuncs{
+		ResolverError: func(_ *stub.BalancerData, _ error) {
+			resolveErrorCh <- struct{}{}
+		},
+	})
+
+	bg := balancergroup.New(balancergroup.Options{
+		CC:              testutils.NewBalancerClientConn(t),
+		BuildOpts:       balancer.BuildOptions{},
+		StateAggregator: nil,
+		Logger:          nil,
+	})
+
+	bg.Add(testBalancerIDs[0], balancer.Get(balancerName))
+	bg.Close()
+
+	bg.ResolverError(errors.New("test error"))
+
+	select {
+	case <-resolveErrorCh:
+		t.Fatalf("ResolverError was called on sub-balancer after BalancerGroup was closed")
+	case <-time.After(defaultTestShortTimeout):
+	}
+}
+
 func (s) TestBalancerExitIdleOne(t *testing.T) {
 	const balancerName = "stub-balancer-test-balancergroup-exit-idle-one"
 	exitIdleCh := make(chan struct{}, 1)
@@ -532,25 +556,80 @@ func (s) TestBalancerExitIdleOne(t *testing.T) {
 		},
 	})
 	cc := testutils.NewBalancerClientConn(t)
-	bg := New(Options{
+	bg := balancergroup.New(balancergroup.Options{
 		CC:              cc,
 		BuildOpts:       balancer.BuildOptions{},
 		StateAggregator: nil,
 		Logger:          nil,
 	})
-	bg.Start()
 	defer bg.Close()
 
 	// Add the stub balancer build above as a child policy.
 	builder := balancer.Get(balancerName)
 	bg.Add(testBalancerIDs[0], builder)
 
-	// Call ExitIdle on the child policy.
+	// Call ExitIdleOne on the child policy.
 	bg.ExitIdleOne(testBalancerIDs[0])
 	select {
 	case <-time.After(time.Second):
 		t.Fatal("Timeout when waiting for ExitIdle to be invoked on child policy")
 	case <-exitIdleCh:
+	}
+}
+
+func (s) TestBalancerGroup_ExitIdleOne_AfterClose(t *testing.T) {
+	balancerName := t.Name()
+	exitIdleCh := make(chan struct{})
+
+	stub.Register(balancerName, stub.BalancerFuncs{
+		ExitIdle: func(_ *stub.BalancerData) {
+			close(exitIdleCh)
+		},
+	})
+
+	bg := balancergroup.New(balancergroup.Options{
+		CC:              testutils.NewBalancerClientConn(t),
+		BuildOpts:       balancer.BuildOptions{},
+		StateAggregator: nil,
+		Logger:          nil,
+	})
+
+	bg.Add(testBalancerIDs[0], balancer.Get(balancerName))
+	bg.Close()
+	bg.ExitIdleOne(testBalancerIDs[0])
+
+	select {
+	case <-time.After(defaultTestShortTimeout):
+	case <-exitIdleCh:
+		t.Fatalf("ExitIdleOne called ExitIdle on sub-balancer after BalancerGroup was closed")
+	}
+}
+
+func (s) TestBalancerGroup_ExitIdleOne_NonExistentID(t *testing.T) {
+	balancerName := t.Name()
+	exitIdleCh := make(chan struct{}, 1)
+
+	stub.Register(balancerName, stub.BalancerFuncs{
+		ExitIdle: func(_ *stub.BalancerData) {
+			exitIdleCh <- struct{}{}
+		},
+	})
+
+	bg := balancergroup.New(balancergroup.Options{
+		CC:              testutils.NewBalancerClientConn(t),
+		BuildOpts:       balancer.BuildOptions{},
+		StateAggregator: nil,
+		Logger:          nil,
+	})
+	defer bg.Close()
+
+	bg.Add(testBalancerIDs[0], balancer.Get(balancerName))
+	bg.ExitIdleOne("non-existent-id")
+
+	select {
+	case <-time.After(defaultTestShortTimeout):
+	case <-exitIdleCh:
+		t.Fatalf("ExitIdleOne called ExitIdle on wrong sub-balancer ID")
 	}
 }
 
@@ -564,7 +643,7 @@ func (s) TestBalancerGracefulSwitch(t *testing.T) {
 	cc := testutils.NewBalancerClientConn(t)
 	gator := weightedaggregator.New(cc, nil, testutils.NewTestWRR)
 	gator.Start()
-	bg := New(Options{
+	bg := balancergroup.New(balancergroup.Options{
 		CC:              cc,
 		BuildOpts:       balancer.BuildOptions{},
 		StateAggregator: gator,
@@ -572,16 +651,16 @@ func (s) TestBalancerGracefulSwitch(t *testing.T) {
 	})
 	gator.Add(testBalancerIDs[0], 1)
 	bg.Add(testBalancerIDs[0], rrBuilder)
-	bg.UpdateClientConnState(testBalancerIDs[0], balancer.ClientConnState{ResolverState: resolver.State{Addresses: testBackendAddrs[0:2]}})
+	bg.UpdateClientConnState(testBalancerIDs[0], balancer.ClientConnState{ResolverState: resolver.State{Endpoints: testBackendEndpoints[0:2]}})
 
-	bg.Start()
+	defer bg.Close()
 
-	m1 := make(map[resolver.Address]balancer.SubConn)
+	m1 := make(map[string]balancer.SubConn)
 	scs := make(map[balancer.SubConn]bool)
 	for i := 0; i < 2; i++ {
 		addrs := <-cc.NewSubConnAddrsCh
 		sc := <-cc.NewSubConnCh
-		m1[addrs[0]] = sc
+		m1[addrs[0].Addr] = sc
 		scs[sc] = true
 		sc.UpdateState(balancer.SubConnState{ConnectivityState: connectivity.Connecting})
 		sc.UpdateState(balancer.SubConnState{ConnectivityState: connectivity.Ready})
@@ -589,7 +668,7 @@ func (s) TestBalancerGracefulSwitch(t *testing.T) {
 
 	p1 := <-cc.NewPickerCh
 	want := []balancer.SubConn{
-		m1[testBackendAddrs[0]], m1[testBackendAddrs[1]],
+		m1[testBackendAddrs[0].Addr], m1[testBackendAddrs[1].Addr],
 	}
 	if err := testutils.IsRoundRobin(want, testutils.SubConnFromPicker(p1)); err != nil {
 		t.Fatal(err)
@@ -602,21 +681,23 @@ func (s) TestBalancerGracefulSwitch(t *testing.T) {
 	childPolicyName := t.Name()
 	stub.Register(childPolicyName, stub.BalancerFuncs{
 		Init: func(bd *stub.BalancerData) {
-			bd.Data = balancer.Get(pickfirst.Name).Build(bd.ClientConn, bd.BuildOptions)
+			bd.ChildBalancer = balancer.Get(pickfirst.Name).Build(bd.ClientConn, bd.BuildOptions)
+		},
+		Close: func(bd *stub.BalancerData) {
+			bd.ChildBalancer.Close()
 		},
 		UpdateClientConnState: func(bd *stub.BalancerData, ccs balancer.ClientConnState) error {
-			ccs.ResolverState.Addresses = ccs.ResolverState.Addresses[1:]
-			bal := bd.Data.(balancer.Balancer)
-			return bal.UpdateClientConnState(ccs)
+			ccs.ResolverState.Endpoints = ccs.ResolverState.Endpoints[1:]
+			return bd.ChildBalancer.UpdateClientConnState(ccs)
 		},
 	})
 	cfgJSON := json.RawMessage(fmt.Sprintf(`[{%q: {}}]`, t.Name()))
-	lbCfg, err := ParseConfig(cfgJSON)
+	lbCfg, err := balancergroup.ParseConfig(cfgJSON)
 	if err != nil {
 		t.Fatalf("ParseConfig(%s) failed: %v", string(cfgJSON), err)
 	}
 	if err := bg.UpdateClientConnState(testBalancerIDs[0], balancer.ClientConnState{
-		ResolverState:  resolver.State{Addresses: testBackendAddrs[2:4]},
+		ResolverState:  resolver.State{Endpoints: testBackendEndpoints[2:4]},
 		BalancerConfig: lbCfg,
 	}); err != nil {
 		t.Fatalf("error updating ClientConn state: %v", err)
@@ -675,5 +756,175 @@ func (s) TestBalancerGracefulSwitch(t *testing.T) {
 				t.Fatalf("Shutdown called for wrong SubConn %v, want in %v", sc, scs)
 			}
 		}
+	}
+}
+
+func (s) TestBalancerExitIdle_All(t *testing.T) {
+	balancer1 := t.Name() + "-1"
+	balancer2 := t.Name() + "-2"
+
+	testID1, testID2 := testBalancerIDs[0], testBalancerIDs[1]
+
+	exitIdleCh1, exitIdleCh2 := make(chan struct{}, 1), make(chan struct{}, 1)
+
+	stub.Register(balancer1, stub.BalancerFuncs{
+		ExitIdle: func(_ *stub.BalancerData) {
+			exitIdleCh1 <- struct{}{}
+		},
+	})
+
+	stub.Register(balancer2, stub.BalancerFuncs{
+		ExitIdle: func(_ *stub.BalancerData) {
+			exitIdleCh2 <- struct{}{}
+		},
+	})
+
+	cc := testutils.NewBalancerClientConn(t)
+	bg := balancergroup.New(balancergroup.Options{
+		CC:              cc,
+		BuildOpts:       balancer.BuildOptions{},
+		StateAggregator: nil,
+		Logger:          nil,
+	})
+	defer bg.Close()
+
+	bg.Add(testID1, balancer.Get(balancer1))
+	bg.Add(testID2, balancer.Get(balancer2))
+
+	bg.ExitIdle()
+
+	errCh := make(chan error, 2)
+
+	go func() {
+		select {
+		case <-exitIdleCh1:
+			errCh <- nil
+		case <-time.After(defaultTestTimeout):
+			errCh <- fmt.Errorf("timeout waiting for ExitIdle on balancer1")
+		}
+	}()
+
+	go func() {
+		select {
+		case <-exitIdleCh2:
+			errCh <- nil
+		case <-time.After(defaultTestTimeout):
+			errCh <- fmt.Errorf("timeout waiting for ExitIdle on balancer2")
+		}
+	}()
+
+	for i := 0; i < 2; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func (s) TestBalancerGroup_ExitIdle_AfterClose(t *testing.T) {
+	balancerName := t.Name()
+	exitIdleCh := make(chan struct{}, 1)
+
+	stub.Register(balancerName, stub.BalancerFuncs{
+		ExitIdle: func(_ *stub.BalancerData) {
+			exitIdleCh <- struct{}{}
+		},
+	})
+
+	bg := balancergroup.New(balancergroup.Options{
+		CC:              testutils.NewBalancerClientConn(t),
+		BuildOpts:       balancer.BuildOptions{},
+		StateAggregator: nil,
+		Logger:          nil,
+	})
+
+	bg.Add(testBalancerIDs[0], balancer.Get(balancerName))
+	bg.Close()
+	bg.ExitIdle()
+
+	select {
+	case <-exitIdleCh:
+		t.Fatalf("ExitIdle was called on sub-balancer even after BalancerGroup was closed")
+	case <-time.After(defaultTestShortTimeout):
+	}
+}
+
+// Tests verifies that the RemoveImmediately method of balancergroup closes the
+// child balancer immediately, while the Remove method does not close the child
+// balancer immediately, when the cache is enabled.
+func (s) TestBalancerGroup_RemoveImmediately(t *testing.T) {
+	// Channels to track child balancer creation and closure.
+	childLBCreated := make(chan string, 1)
+	childLBClosed := make(chan string, 1)
+
+	childLBName1 := strings.ToLower(t.Name()) + "-child-1"
+	t.Logf("Registering a child balancer with name %q", childLBName1)
+	stub.Register(childLBName1, stub.BalancerFuncs{
+		Init: func(*stub.BalancerData) {
+			childLBCreated <- childLBName1
+		},
+		Close: func(*stub.BalancerData) {
+			childLBClosed <- childLBName1
+		},
+	})
+
+	childLBName2 := strings.ToLower(t.Name()) + "-child-2"
+	t.Logf("Registering a child balancer with name %q", childLBName2)
+	stub.Register(childLBName2, stub.BalancerFuncs{
+		Init: func(*stub.BalancerData) {
+			childLBCreated <- childLBName2
+		},
+		Close: func(*stub.BalancerData) {
+			childLBClosed <- childLBName2
+		},
+	})
+
+	t.Logf("Creating a balancergroup with cache enabled")
+	tcc := testutils.NewBalancerClientConn(t)
+	bg := balancergroup.New(balancergroup.Options{
+		CC:                      tcc,
+		BuildOpts:               balancer.BuildOptions{},
+		SubBalancerCloseTimeout: defaultTestTimeout,
+	})
+
+	t.Logf("Adding a child balancer with name %q to the group", "child-1")
+	bg.AddWithClientConn("child-1", childLBName1, tcc)
+	select {
+	case <-childLBCreated:
+	case <-time.After(defaultTestTimeout):
+		t.Fatalf("Timeout when waiting for child LB to be created")
+	}
+
+	t.Logf("Adding a child balancer with name %q to the group", "child-2")
+	bg.AddWithClientConn("child-2", childLBName2, tcc)
+	select {
+	case <-childLBCreated:
+	case <-time.After(defaultTestTimeout):
+		t.Fatalf("Timeout when waiting for child LB to be created")
+	}
+
+	t.Logf("Removing the child balancer with name %q from the group with immediate effect", "child-1")
+	bg.RemoveImmediately("child-1")
+	select {
+	case <-childLBClosed:
+	case <-time.After(defaultTestTimeout):
+		t.Fatalf("Timeout when waiting for child LB to be closed")
+	}
+
+	t.Logf("Removing the child balancer with name %q from the group with caching", "child-2")
+	bg.Remove("child-2")
+	sCtx, sCancel := context.WithTimeout(context.Background(), defaultTestShortTimeout)
+	defer sCancel()
+	select {
+	case <-childLBClosed:
+		t.Fatalf("Child LB closed when expected to be cached")
+	case <-sCtx.Done():
+	}
+
+	t.Logf("Closing the balancergroup, which should close the second child balancer")
+	bg.Close()
+	select {
+	case <-childLBClosed:
+	case <-time.After(defaultTestTimeout):
+		t.Fatalf("Timeout when waiting for child LB to be closed")
 	}
 }

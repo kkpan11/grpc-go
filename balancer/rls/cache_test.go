@@ -119,7 +119,7 @@ func (s) TestLRU_BasicOperations(t *testing.T) {
 
 func (s) TestDataCache_BasicOperations(t *testing.T) {
 	initCacheEntries()
-	dc := newDataCache(5, nil)
+	dc := newDataCache(5, nil, "")
 	for i, k := range cacheKeys {
 		dc.addEntry(k, cacheEntries[i])
 	}
@@ -133,7 +133,7 @@ func (s) TestDataCache_BasicOperations(t *testing.T) {
 
 func (s) TestDataCache_AddForcesResize(t *testing.T) {
 	initCacheEntries()
-	dc := newDataCache(1, nil)
+	dc := newDataCache(1, nil, "")
 
 	// The first entry in cacheEntries has a minimum expiry time in the future.
 	// This entry would stop the resize operation since we do not evict entries
@@ -162,7 +162,7 @@ func (s) TestDataCache_AddForcesResize(t *testing.T) {
 
 func (s) TestDataCache_Resize(t *testing.T) {
 	initCacheEntries()
-	dc := newDataCache(5, nil)
+	dc := newDataCache(5, nil, "")
 	for i, k := range cacheKeys {
 		dc.addEntry(k, cacheEntries[i])
 	}
@@ -193,7 +193,7 @@ func (s) TestDataCache_Resize(t *testing.T) {
 
 func (s) TestDataCache_EvictExpiredEntries(t *testing.T) {
 	initCacheEntries()
-	dc := newDataCache(5, nil)
+	dc := newDataCache(5, nil, "")
 	for i, k := range cacheKeys {
 		dc.addEntry(k, cacheEntries[i])
 	}
@@ -220,7 +220,7 @@ func (s) TestDataCache_ResetBackoffState(t *testing.T) {
 	}
 
 	initCacheEntries()
-	dc := newDataCache(5, nil)
+	dc := newDataCache(5, nil, "")
 	for i, k := range cacheKeys {
 		dc.addEntry(k, cacheEntries[i])
 	}

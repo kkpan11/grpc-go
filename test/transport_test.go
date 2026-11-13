@@ -19,16 +19,21 @@ package test
 
 import (
 	"context"
+	"encoding/binary"
 	"io"
 	"net"
 	"sync"
 	"testing"
+	"time"
 
+	"golang.org/x/net/http2"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/internal/grpcsync"
 	"google.golang.org/grpc/internal/stubserver"
+	"google.golang.org/grpc/internal/testutils"
 	"google.golang.org/grpc/internal/transport"
 	"google.golang.org/grpc/status"
 
@@ -58,7 +63,7 @@ type transportRestartCheckCreds struct {
 func (c *transportRestartCheckCreds) ServerHandshake(rawConn net.Conn) (net.Conn, credentials.AuthInfo, error) {
 	return rawConn, nil, nil
 }
-func (c *transportRestartCheckCreds) ClientHandshake(ctx context.Context, authority string, rawConn net.Conn) (net.Conn, credentials.AuthInfo, error) {
+func (c *transportRestartCheckCreds) ClientHandshake(_ context.Context, _ string, rawConn net.Conn) (net.Conn, credentials.AuthInfo, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	conn := &connWrapperWithCloseCh{Conn: rawConn, close: grpcsync.NewEvent()}
@@ -71,7 +76,7 @@ func (c *transportRestartCheckCreds) Info() credentials.ProtocolInfo {
 func (c *transportRestartCheckCreds) Clone() credentials.TransportCredentials {
 	return c
 }
-func (c *transportRestartCheckCreds) OverrideServerName(s string) error {
+func (c *transportRestartCheckCreds) OverrideServerName(string) error {
 	return nil
 }
 
@@ -151,5 +156,200 @@ func (s) TestClientTransportRestartsAfterStreamIDExhausted(t *testing.T) {
 	case <-creds.connections[0].close.Done():
 	case <-ctx.Done():
 		t.Fatal("Timeout expired when waiting for first client transport to close")
+	}
+}
+
+// Tests that an RST_STREAM frame that causes an io.ErrUnexpectedEOF while
+// reading a gRPC message is correctly converted to a gRPC status with code
+// CANCELLED. The test sends a data frame with a partial gRPC message, followed
+// by an RST_STREAM frame with HTTP/2 code CANCELLED. The test asserts the
+// client receives the correct status.
+func (s) TestRSTDuringMessageRead(t *testing.T) {
+	lis, err := testutils.LocalTCPListener()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	cc, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc.NewClient(%s) = %v", lis.Addr().String(), err)
+	}
+	defer cc.Close()
+
+	go func() {
+		conn, err := lis.Accept()
+		if err != nil {
+			t.Errorf("lis.Accept() = %v", err)
+			return
+		}
+		defer conn.Close()
+		framer := http2.NewFramer(conn, conn)
+
+		if _, err := io.ReadFull(conn, make([]byte, len(clientPreface))); err != nil {
+			t.Errorf("Error while reading client preface: %v", err)
+			return
+		}
+		if err := framer.WriteSettings(); err != nil {
+			t.Errorf("Error while writing settings: %v", err)
+			return
+		}
+		if err := framer.WriteSettingsAck(); err != nil {
+			t.Errorf("Error while writing settings: %v", err)
+			return
+		}
+		for ctx.Err() == nil {
+			frame, err := framer.ReadFrame()
+			if err != nil {
+				return
+			}
+			switch frame := frame.(type) {
+			case *http2.HeadersFrame:
+				// When the client creates a stream, write a partial gRPC
+				// message followed by an RST_STREAM.
+				const messageLen = 2048
+				buf := make([]byte, messageLen/2)
+				// Write the gRPC message length header.
+				binary.BigEndian.PutUint32(buf[1:5], uint32(messageLen))
+				if err := framer.WriteData(1, false, buf); err != nil {
+					return
+				}
+				framer.WriteRSTStream(1, http2.ErrCodeCancel)
+			default:
+				t.Logf("Server received frame: %v", frame)
+			}
+		}
+	}()
+
+	// The server will send a partial gRPC message before cancelling the stream.
+	// The client should get a gRPC status with code CANCELLED.
+	client := testgrpc.NewTestServiceClient(cc)
+	if _, err := client.EmptyCall(ctx, &testpb.Empty{}); status.Code(err) != codes.Canceled {
+		t.Fatalf("client.EmptyCall() returned %v; want status with code %v", err, codes.Canceled)
+	}
+}
+
+// Test verifies that a client-side cancellation correctly frees up resources on
+// the server. The test setup is designed to simulate a scenario where a server
+// is blocked from sending a large message due to a full client-side flow
+// control window. The client-side cancellation of this blocked RPC then frees
+// up the max concurrent streams quota on the server, allowing a new RPC to be
+// created successfully.
+func (s) TestCancelWhileServerWaitingForFlowControl(t *testing.T) {
+	serverDoneCh := make(chan struct{}, 2)
+	const flowControlWindowSize = 65535
+	ss := &stubserver.StubServer{
+		StreamingOutputCallF: func(_ *testpb.StreamingOutputCallRequest, stream testgrpc.TestService_StreamingOutputCallServer) error {
+			// Send a large message to exhaust the client's flow control window.
+			stream.Send(&testpb.StreamingOutputCallResponse{
+				Payload: &testpb.Payload{
+					Body: make([]byte, flowControlWindowSize+1),
+				},
+			})
+			serverDoneCh <- struct{}{}
+			return nil
+		},
+	}
+
+	// Create a server that allows only 1 stream at a time.
+	ss = stubserver.StartTestService(t, ss, grpc.MaxConcurrentStreams(1))
+	defer ss.Stop()
+	// Use a static flow control window.
+	if err := ss.StartClient(grpc.WithStaticStreamWindowSize(flowControlWindowSize)); err != nil {
+		t.Fatalf("Error while start test service client: %v", err)
+	}
+	client := ss.Client
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+
+	streamCtx, streamCancel := context.WithCancel(ctx)
+	defer streamCancel()
+
+	if _, err := client.StreamingOutputCall(streamCtx, &testpb.StreamingOutputCallRequest{}); err != nil {
+		t.Fatalf("Failed to create server streaming RPC: %v", err)
+	}
+
+	// Wait for the server handler to return. This should cause the trailers to
+	// be buffered on the server, waiting for flow control quota to first send
+	// the data frame.
+	select {
+	case <-ctx.Done():
+		t.Fatal("Context timed out waiting for server handler to return.")
+	case <-serverDoneCh:
+	}
+
+	// Attempt to create a stream. It should fail since the previous stream is
+	// still blocked.
+	shortCtx, shortCancel := context.WithTimeout(ctx, defaultTestShortTimeout)
+	defer shortCancel()
+	_, err := client.StreamingOutputCall(shortCtx, &testpb.StreamingOutputCallRequest{})
+	if status.Code(err) != codes.DeadlineExceeded {
+		t.Fatalf("Server stream creation returned error with unexpected status code: %v, want code: %v", err, codes.DeadlineExceeded)
+	}
+
+	// Cancel the RPC, this should free up concurrent stream quota on the
+	// server.
+	streamCancel()
+
+	// Attempt to create another stream.
+	stream, err := client.StreamingOutputCall(ctx, &testpb.StreamingOutputCallRequest{})
+	if err != nil {
+		t.Fatalf("Failed to create server streaming RPC: %v", err)
+	}
+	_, err = stream.Recv()
+	if err != nil {
+		t.Fatalf("Failed to read from the stream: %v", err)
+	}
+}
+
+// Tests that when a client sends a HEADERS frame with EndStream=true, the
+// server-side stream receives an io.EOF on Recv() and does not hang waiting
+// for data frames.
+func (s) TestHeadersEndStreamNoHang(t *testing.T) {
+	receivedErr := make(chan error, 1)
+	ss := &stubserver.StubServer{
+		FullDuplexCallF: func(stream testgrpc.TestService_FullDuplexCallServer) error {
+			_, err := stream.Recv()
+			receivedErr <- err
+			return nil
+		},
+	}
+	if err := ss.Start(nil); err != nil {
+		t.Fatalf("Error starting endpoint server: %v", err)
+	}
+	defer ss.Stop()
+
+	conn, err := net.DialTimeout("tcp", ss.Address, defaultTestTimeout)
+	if err != nil {
+		t.Fatalf("Failed to dial: %v", err)
+	}
+	defer conn.Close()
+
+	st := newServerTesterFromConn(t, conn)
+	st.greet()
+
+	// Send HEADERS with EndStream = true and no grpc-timeout header.
+	st.writeHeaders(http2.HeadersFrameParam{
+		StreamID: 1,
+		BlockFragment: st.encodeHeader(
+			":method", "POST",
+			":path", "/grpc.testing.TestService/FullDuplexCall",
+			":authority", "localhost",
+			"content-type", "application/grpc",
+			"te", "trailers",
+		),
+		EndStream:  true,
+		EndHeaders: true,
+	})
+
+	select {
+	case err := <-receivedErr:
+		if err != io.EOF {
+			t.Errorf("Streaming handler returned error = %v, expected io.EOF", err)
+		}
+	case <-time.After(defaultTestTimeout):
+		t.Fatalf("Timed out waiting for Recv() on the server to complete")
 	}
 }

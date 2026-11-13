@@ -25,6 +25,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	v3xdsxdstypepb "github.com/cncf/xds/go/xds/type/v3"
@@ -33,11 +34,14 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/authz/audit"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/internal"
 	"google.golang.org/grpc/internal/testutils"
 	"google.golang.org/grpc/internal/testutils/xds/e2e"
+	"google.golang.org/grpc/internal/testutils/xds/e2e/setup"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/grpc/xds"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
@@ -59,7 +63,7 @@ import (
 // (NonForwardingAction), and the RPC's matching those routes should proceed as
 // normal.
 func (s) TestServerSideXDS_RouteConfiguration(t *testing.T) {
-	managementServer, nodeID, bootstrapContents, xdsResolver := setupManagementServerAndResolver(t)
+	managementServer, nodeID, bootstrapContents, xdsResolver := setup.ManagementServerAndResolver(t)
 
 	lis, cleanup2 := setupGRPCServer(t, bootstrapContents)
 	defer cleanup2()
@@ -244,9 +248,9 @@ func (s) TestServerSideXDS_RouteConfiguration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cc, err := grpc.DialContext(ctx, fmt.Sprintf("xds:///%s", serviceName), grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithResolvers(xdsResolver))
+	cc, err := grpc.NewClient(fmt.Sprintf("xds:///%s", serviceName), grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithResolvers(xdsResolver))
 	if err != nil {
-		t.Fatalf("failed to dial local test server: %v", err)
+		t.Fatalf("grpc.NewClient() failed: %v", err)
 	}
 	defer cc.Close()
 
@@ -264,8 +268,12 @@ func (s) TestServerSideXDS_RouteConfiguration(t *testing.T) {
 	// This Unary Call should match to a route with an incorrect action. Thus,
 	// this RPC should not go through as per A36, and this call should receive
 	// an error with codes.Unavailable.
-	if _, err = client.UnaryCall(ctx, &testpb.SimpleRequest{}); status.Code(err) != codes.Unavailable {
+	_, err = client.UnaryCall(ctx, &testpb.SimpleRequest{})
+	if status.Code(err) != codes.Unavailable {
 		t.Fatalf("client.UnaryCall() = _, %v, want _, error code %s", err, codes.Unavailable)
+	}
+	if !strings.Contains(err.Error(), nodeID) {
+		t.Fatalf("client.UnaryCall() = %v, want xDS node id %q", err, nodeID)
 	}
 
 	// This Streaming Call should match to a route with an incorrect action.
@@ -275,8 +283,13 @@ func (s) TestServerSideXDS_RouteConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StreamingInputCall(_) = _, %v, want <nil>", err)
 	}
-	if _, err = stream.CloseAndRecv(); status.Code(err) != codes.Unavailable || !strings.Contains(err.Error(), "the incoming RPC matched to a route that was not of action type non forwarding") {
-		t.Fatalf("streaming RPC should have been denied")
+	_, err = stream.CloseAndRecv()
+	const wantStreamingErr = "the incoming RPC matched to a route that was not of action type non forwarding"
+	if status.Code(err) != codes.Unavailable || !strings.Contains(err.Error(), wantStreamingErr) {
+		t.Fatalf("client.StreamingInputCall() = %v, want error with code %s and message %q", err, codes.Unavailable, wantStreamingErr)
+	}
+	if !strings.Contains(err.Error(), nodeID) {
+		t.Fatalf("client.StreamingInputCall() = %v, want xDS node id %q", err, nodeID)
 	}
 
 	// This Full Duplex should not match to a route, and thus should return an
@@ -285,8 +298,13 @@ func (s) TestServerSideXDS_RouteConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FullDuplexCall(_) = _, %v, want <nil>", err)
 	}
-	if _, err = dStream.Recv(); status.Code(err) != codes.Unavailable || !strings.Contains(err.Error(), "the incoming RPC did not match a configured Route") {
-		t.Fatalf("streaming RPC should have been denied")
+	_, err = dStream.Recv()
+	const wantFullDuplexErr = "the incoming RPC did not match a configured Route"
+	if status.Code(err) != codes.Unavailable || !strings.Contains(err.Error(), wantFullDuplexErr) {
+		t.Fatalf("client.FullDuplexCall() = %v, want error with code %s and message %q", err, codes.Unavailable, wantFullDuplexErr)
+	}
+	if !strings.Contains(err.Error(), nodeID) {
+		t.Fatalf("client.FullDuplexCall() = %v, want xDS node id %q", err, nodeID)
 	}
 }
 
@@ -401,8 +419,6 @@ func serverListenerWithRBACHTTPFilters(t *testing.T, host string, port uint32, r
 // as normal and certain RPC's are denied by the RBAC HTTP Filter which gets
 // called by hooked xds interceptors.
 func (s) TestRBACHTTPFilter(t *testing.T) {
-	internal.RegisterRBACHTTPFilterForTesting()
-	defer internal.UnregisterRBACHTTPFilterForTesting()
 	tests := []struct {
 		name                string
 		rbacCfg             *rpb.RBAC
@@ -466,6 +482,30 @@ func (s) TestRBACHTTPFilter(t *testing.T) {
 						"certain-path": {
 							Permissions: []*v3rbacpb.Permission{
 								{Rule: &v3rbacpb.Permission_UrlPath{UrlPath: &v3matcherpb.PathMatcher{Rule: &v3matcherpb.PathMatcher_Path{Path: &v3matcherpb.StringMatcher{MatchPattern: &v3matcherpb.StringMatcher_Exact{Exact: "/grpc.testing.TestService/UnaryCall"}}}}}},
+							},
+							Principals: []*v3rbacpb.Principal{
+								{Identifier: &v3rbacpb.Principal_Any{Any: true}},
+							},
+						},
+					},
+				},
+			},
+			wantStatusEmptyCall: codes.PermissionDenied,
+			wantStatusUnaryCall: codes.OK,
+		},
+		// This test tests an RBAC HTTP Filter which is configured to allow only
+		// RPC's with certain paths ("UnaryCall") via the ":path" header. Only
+		// unary calls passing through this RBAC HTTP Filter should proceed as
+		// normal, and any others should be denied.
+		{
+			name: "allow-certain-path-by-header",
+			rbacCfg: &rpb.RBAC{
+				Rules: &v3rbacpb.RBAC{
+					Action: v3rbacpb.RBAC_ALLOW,
+					Policies: map[string]*v3rbacpb.Policy{
+						"certain-path": {
+							Permissions: []*v3rbacpb.Permission{
+								{Rule: &v3rbacpb.Permission_Header{Header: &v3routepb.HeaderMatcher{Name: ":path", HeaderMatchSpecifier: &v3routepb.HeaderMatcher_ExactMatch{ExactMatch: "/grpc.testing.TestService/UnaryCall"}}}},
 							},
 							Principals: []*v3rbacpb.Principal{
 								{Identifier: &v3rbacpb.Principal_Any{Any: true}},
@@ -544,6 +584,52 @@ func (s) TestRBACHTTPFilter(t *testing.T) {
 			wantStatusEmptyCall: codes.OK,
 			wantStatusUnaryCall: codes.OK,
 		},
+		// This test tests that a "Host" header matcher behaves the same as a
+		// "host" one. gRPC lowercases every metadata key, so the alias to
+		// :authority must not depend on how the control plane spells the name.
+		{
+			name: "match-on-host-canonical-case",
+			rbacCfg: &rpb.RBAC{
+				Rules: &v3rbacpb.RBAC{
+					Action: v3rbacpb.RBAC_ALLOW,
+					Policies: map[string]*v3rbacpb.Policy{
+						"match-on-authority": {
+							Permissions: []*v3rbacpb.Permission{
+								{Rule: &v3rbacpb.Permission_Header{Header: &v3routepb.HeaderMatcher{Name: "Host", HeaderMatchSpecifier: &v3routepb.HeaderMatcher_PrefixMatch{PrefixMatch: "my-service-fallback"}}}},
+							},
+							Principals: []*v3rbacpb.Principal{
+								{Identifier: &v3rbacpb.Principal_Any{Any: true}},
+							},
+						},
+					},
+				},
+			},
+			wantStatusEmptyCall: codes.OK,
+			wantStatusUnaryCall: codes.OK,
+		},
+		// This test tests that a header matcher whose name is not lowercase
+		// still matches the header. Every RPC carries a user agent, so the
+		// RBAC Configuration below denies every RPC tried.
+		{
+			name: "deny-header-name-in-canonical-case",
+			rbacCfg: &rpb.RBAC{
+				Rules: &v3rbacpb.RBAC{
+					Action: v3rbacpb.RBAC_DENY,
+					Policies: map[string]*v3rbacpb.Policy{
+						"user-agent": {
+							Permissions: []*v3rbacpb.Permission{
+								{Rule: &v3rbacpb.Permission_Header{Header: &v3routepb.HeaderMatcher{Name: "User-Agent", HeaderMatchSpecifier: &v3routepb.HeaderMatcher_PresentMatch{PresentMatch: true}}}},
+							},
+							Principals: []*v3rbacpb.Principal{
+								{Identifier: &v3rbacpb.Principal_Any{Any: true}},
+							},
+						},
+					},
+				},
+			},
+			wantStatusEmptyCall: codes.PermissionDenied,
+			wantStatusUnaryCall: codes.PermissionDenied,
+		},
 		// This test tests that the RBAC HTTP Filter hard codes the :method
 		// header to POST. Since the RBAC Configuration says to deny every RPC
 		// with a method :POST, every RPC tried should be denied.
@@ -566,6 +652,48 @@ func (s) TestRBACHTTPFilter(t *testing.T) {
 			},
 			wantStatusEmptyCall: codes.PermissionDenied,
 			wantStatusUnaryCall: codes.PermissionDenied,
+		},
+		{
+			name: "match-on-principal-remote-ip",
+			rbacCfg: &rpb.RBAC{
+				Rules: &v3rbacpb.RBAC{
+					Action: v3rbacpb.RBAC_ALLOW,
+					Policies: map[string]*v3rbacpb.Policy{
+						"match-on-principal-remote-ip": {
+							Permissions: []*v3rbacpb.Permission{
+								{
+									Rule: &v3rbacpb.Permission_Header{
+										Header: &v3routepb.HeaderMatcher{
+											Name:                 "host",
+											HeaderMatchSpecifier: &v3routepb.HeaderMatcher_PrefixMatch{PrefixMatch: "my-service-fallback"},
+										},
+									},
+								},
+							},
+							Principals: []*v3rbacpb.Principal{
+								{
+									Identifier: &v3rbacpb.Principal_RemoteIp{
+										RemoteIp: &v3corepb.CidrRange{
+											AddressPrefix: "127.0.0.0",
+											PrefixLen:     &wrapperspb.UInt32Value{Value: 8},
+										},
+									},
+								},
+								{
+									Identifier: &v3rbacpb.Principal_RemoteIp{
+										RemoteIp: &v3corepb.CidrRange{
+											AddressPrefix: "::1",
+											PrefixLen:     &wrapperspb.UInt32Value{Value: 128},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			wantStatusEmptyCall: codes.OK,
+			wantStatusUnaryCall: codes.OK,
 		},
 		// This test tests that RBAC ignores the TE: trailers header (which is
 		// hardcoded in http2_client.go for every RPC). Since the RBAC
@@ -594,7 +722,7 @@ func (s) TestRBACHTTPFilter(t *testing.T) {
 		// This test tests that an RBAC Config with Action.LOG configured allows
 		// every RPC through. This maps to the line "At this time, if the
 		// RBAC.action is Action.LOG then the policy will be completely ignored,
-		// as if RBAC was not configurated." from A41
+		// as if RBAC was not configured." from A41
 		{
 			name: "action-log",
 			rbacCfg: &rpb.RBAC{
@@ -626,7 +754,7 @@ func (s) TestRBACHTTPFilter(t *testing.T) {
 				}
 				audit.RegisterLoggerBuilder(lb)
 
-				managementServer, nodeID, bootstrapContents, xdsResolver := setupManagementServerAndResolver(t)
+				managementServer, nodeID, bootstrapContents, xdsResolver := setup.ManagementServerAndResolver(t)
 
 				lis, cleanup2 := setupGRPCServer(t, bootstrapContents)
 				defer cleanup2()
@@ -653,9 +781,9 @@ func (s) TestRBACHTTPFilter(t *testing.T) {
 					t.Fatal(err)
 				}
 
-				cc, err := grpc.DialContext(ctx, fmt.Sprintf("xds:///%s", serviceName), grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithResolvers(xdsResolver))
+				cc, err := grpc.NewClient(fmt.Sprintf("xds:///%s", serviceName), grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithResolvers(xdsResolver))
 				if err != nil {
-					t.Fatalf("failed to dial local test server: %v", err)
+					t.Fatalf("grpc.NewClient() failed: %v", err)
 				}
 				defer cc.Close()
 
@@ -669,6 +797,8 @@ func (s) TestRBACHTTPFilter(t *testing.T) {
 					t.Fatalf("UnaryCall() returned err with status: %v, wantStatusUnaryCall: %v", err, test.wantStatusUnaryCall)
 				}
 
+				lb.mu.Lock()
+				defer lb.mu.Unlock()
 				if test.wantAuthzOutcomes != nil {
 					if diff := cmp.Diff(lb.authzDecisionStat, test.wantAuthzOutcomes); diff != "" {
 						t.Fatalf("authorization decision do not match\ndiff (-got +want):\n%s", diff)
@@ -801,11 +931,24 @@ func serverListenerWithBadRouteConfiguration(t *testing.T, host string, port uin
 	}
 }
 
-func (s) TestRBACToggledOn_WithBadRouteConfiguration(t *testing.T) {
-	managementServer, nodeID, bootstrapContents, xdsResolver := setupManagementServerAndResolver(t)
+func (s) TestRBAC_WithBadRouteConfiguration(t *testing.T) {
+	managementServer, nodeID, bootstrapContents, xdsResolver := setup.ManagementServerAndResolver(t)
+	// We need to wait for the server to enter SERVING mode before making RPCs
+	// to avoid flakes due to the server closing connections.
+	servingCh := make(chan struct{})
 
-	lis, cleanup2 := setupGRPCServer(t, bootstrapContents)
+	// Initialize a test gRPC server, assign it to the stub server, and start
+	// the test service.
+	opt := xds.ServingModeCallback(func(_ net.Addr, args xds.ServingModeChangeArgs) {
+		if args.Mode == connectivity.ServingModeServing {
+			close(servingCh)
+		}
+	})
+	lis, cleanup2 := setupGRPCServer(t, bootstrapContents, opt)
 	defer cleanup2()
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
 
 	host, port, err := hostPortFromListener(lis)
 	if err != nil {
@@ -828,55 +971,69 @@ func (s) TestRBACToggledOn_WithBadRouteConfiguration(t *testing.T) {
 	inboundLis := serverListenerWithBadRouteConfiguration(t, host, port)
 	resources.Listeners = append(resources.Listeners, inboundLis)
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
-	defer cancel()
 	// Setup the management server with client and server-side resources.
 	if err := managementServer.Update(ctx, resources); err != nil {
 		t.Fatal(err)
 	}
 
-	cc, err := grpc.DialContext(ctx, fmt.Sprintf("xds:///%s", serviceName), grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithResolvers(xdsResolver))
+	select {
+	case <-ctx.Done():
+		t.Fatal("Timeout waiting for the xDS-enabled gRPC server to go SERVING")
+	case <-servingCh:
+	}
+
+	cc, err := grpc.NewClient(fmt.Sprintf("xds:///%s", serviceName), grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithResolvers(xdsResolver))
 	if err != nil {
-		t.Fatalf("failed to dial local test server: %v", err)
+		t.Fatalf("grpc.NewClient() failed: %v", err)
 	}
 	defer cc.Close()
 
 	client := testgrpc.NewTestServiceClient(cc)
-	if _, err := client.EmptyCall(ctx, &testpb.Empty{}); status.Code(err) != codes.Unavailable {
-		t.Fatalf("EmptyCall() returned err with status: %v, if RBAC is disabled all RPC's should proceed as normal", status.Code(err))
+	_, err = client.EmptyCall(ctx, &testpb.Empty{})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("EmptyCall() returned %v, want Unavailable", err)
 	}
-	if _, err := client.UnaryCall(ctx, &testpb.SimpleRequest{}); status.Code(err) != codes.Unavailable {
-		t.Fatalf("UnaryCall() returned err with status: %v, if RBAC is disabled all RPC's should proceed as normal", status.Code(err))
+	if !strings.Contains(err.Error(), nodeID) {
+		t.Fatalf("EmptyCall() = %v, want xDS node id %q", err, nodeID)
+	}
+	_, err = client.UnaryCall(ctx, &testpb.SimpleRequest{})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("UnaryCall() returned %v, want Unavailable", err)
+	}
+	if !strings.Contains(err.Error(), nodeID) {
+		t.Fatalf("UnaryCall() = %v, want xDS node id %q", err, nodeID)
 	}
 }
 
 type statAuditLogger struct {
+	builder *loggerBuilder
+}
+
+func (s *statAuditLogger) Log(event *audit.Event) {
+	b := s.builder
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.authzDecisionStat[event.Authorized]++
+	*b.lastEvent = *event
+}
+
+type loggerBuilder struct {
+	mu                sync.Mutex
 	authzDecisionStat map[bool]int // Map to hold counts of authorization decisions
 	lastEvent         *audit.Event // Field to store last received event
 }
 
-func (s *statAuditLogger) Log(event *audit.Event) {
-	s.authzDecisionStat[event.Authorized]++
-	*s.lastEvent = *event
-}
-
-type loggerBuilder struct {
-	authzDecisionStat map[bool]int
-	lastEvent         *audit.Event
-}
-
-func (loggerBuilder) Name() string {
+func (*loggerBuilder) Name() string {
 	return "stat_logger"
 }
 
 func (lb *loggerBuilder) Build(audit.LoggerConfig) audit.Logger {
 	return &statAuditLogger{
-		authzDecisionStat: lb.authzDecisionStat,
-		lastEvent:         lb.lastEvent,
+		builder: lb,
 	}
 }
 
-func (*loggerBuilder) ParseLoggerConfig(config json.RawMessage) (audit.LoggerConfig, error) {
+func (*loggerBuilder) ParseLoggerConfig(json.RawMessage) (audit.LoggerConfig, error) {
 	return nil, nil
 }
 
@@ -900,4 +1057,145 @@ func createXDSTypedStruct(t *testing.T, in map[string]any, name string) *anypb.A
 		t.Fatalf("createXDSTypedStruct failed during anypb.New: %v", err)
 	}
 	return customConfig
+}
+
+// Test verifies server-side route matching against incoming metadata.
+// It focuses on a single Exact matcher to confirm restrictive per-route
+// RBAC policy selection, while explicitly testing resistance to context
+// conflation (Conflicting Contexts regression).
+func (s) TestServerSideXDS_RBACRouteHeaderMatchers(t *testing.T) {
+	const serviceName = "my-service-regression"
+	managementServer, nodeID, bootstrapContents, xdsResolver := setup.ManagementServerAndResolver(t)
+
+	// Inject conflicting OutgoingContext on the server to verify it is ignored
+	// by routing.
+	opt := grpc.UnaryInterceptor(func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		// This simulates leakage or presence of OutgoingContext on the server.
+		ctx = metadata.NewOutgoingContext(ctx, metadata.Pairs("x-route", "client-target"))
+		return handler(ctx, req)
+	})
+
+	lis, stopServer := setupGRPCServer(t, bootstrapContents, opt)
+	defer stopServer()
+
+	host, port, err := hostPortFromListener(lis)
+	if err != nil {
+		t.Fatalf("Failed to retrieve host and port of server: %v", err)
+	}
+	resources := e2e.DefaultClientResources(e2e.ResourceParams{
+		DialTarget: serviceName,
+		NodeID:     nodeID,
+		Host:       host,
+		Port:       port,
+		SecLevel:   e2e.SecurityLevelNone,
+	})
+
+	// Setup a route with an Exact Matcher.
+	matcher := &v3routepb.HeaderMatcher{
+		Name: "x-route",
+		HeaderMatchSpecifier: &v3routepb.HeaderMatcher_ExactMatch{
+			ExactMatch: "server-target",
+		},
+	}
+
+	vhs := []*v3routepb.VirtualHost{{
+		Domains: []string{"*"},
+		Routes: []*v3routepb.Route{
+			{
+				Match: &v3routepb.RouteMatch{
+					PathSpecifier: &v3routepb.RouteMatch_Prefix{Prefix: "/grpc.testing.TestService/EmptyCall"},
+					Headers:       []*v3routepb.HeaderMatcher{matcher},
+				},
+				Action: &v3routepb.Route_NonForwardingAction{},
+				TypedPerFilterConfig: map[string]*anypb.Any{
+					"rbac": testutils.MarshalAny(t, &rpb.RBACPerRoute{Rbac: &rpb.RBAC{Rules: &v3rbacpb.RBAC{
+						Action: v3rbacpb.RBAC_DENY,
+						Policies: map[string]*v3rbacpb.Policy{
+							"deny-all": {
+								Permissions: []*v3rbacpb.Permission{{Rule: &v3rbacpb.Permission_Any{Any: true}}},
+								Principals:  []*v3rbacpb.Principal{{Identifier: &v3rbacpb.Principal_Any{Any: true}}},
+							},
+						},
+					}}}),
+				},
+			},
+			{
+				Match: &v3routepb.RouteMatch{
+					PathSpecifier: &v3routepb.RouteMatch_Prefix{Prefix: "/grpc.testing.TestService/EmptyCall"},
+				},
+				Action: &v3routepb.Route_NonForwardingAction{},
+			},
+		},
+	}}
+
+	inboundLis := &v3listenerpb.Listener{
+		Name: fmt.Sprintf(e2e.ServerListenerResourceNameTemplate, net.JoinHostPort(host, strconv.Itoa(int(port)))),
+		Address: &v3corepb.Address{
+			Address: &v3corepb.Address_SocketAddress{
+				SocketAddress: &v3corepb.SocketAddress{
+					Address: host,
+					PortSpecifier: &v3corepb.SocketAddress_PortValue{
+						PortValue: port,
+					},
+				},
+			},
+		},
+		DefaultFilterChain: &v3listenerpb.FilterChain{Filters: []*v3listenerpb.Filter{{
+			Name: "hcm",
+			ConfigType: &v3listenerpb.Filter_TypedConfig{
+				TypedConfig: testutils.MarshalAny(t, &v3httppb.HttpConnectionManager{
+					HttpFilters: []*v3httppb.HttpFilter{
+						e2e.HTTPFilter("rbac", &rpb.RBAC{Rules: &v3rbacpb.RBAC{
+							Action: v3rbacpb.RBAC_ALLOW,
+							Policies: map[string]*v3rbacpb.Policy{
+								"allow-all": {
+									Permissions: []*v3rbacpb.Permission{{Rule: &v3rbacpb.Permission_Any{Any: true}}},
+									Principals:  []*v3rbacpb.Principal{{Identifier: &v3rbacpb.Principal_Any{Any: true}}},
+								},
+							},
+						}}),
+						e2e.RouterHTTPFilter,
+					},
+					RouteSpecifier: &v3httppb.HttpConnectionManager_RouteConfig{
+						RouteConfig: &v3routepb.RouteConfiguration{
+							Name:         "routeName",
+							VirtualHosts: vhs,
+						},
+					},
+				}),
+			},
+		}}},
+	}
+	resources.Listeners = append(resources.Listeners, inboundLis)
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	if err := managementServer.Update(ctx, resources); err != nil {
+		t.Fatal(err)
+	}
+
+	cc, err := grpc.NewClient(fmt.Sprintf("xds:///%s", serviceName), grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithResolvers(xdsResolver))
+	if err != nil {
+		t.Fatalf("grpc.NewClient() failed: %v", err)
+	}
+	defer cc.Close()
+
+	client := testgrpc.NewTestServiceClient(cc)
+
+	// Make an RPC with metadata matching the header matcher. We pass
+	// "server-target" in OutgoingContext (client side). This becomes
+	// IncomingContext on server-side. If the server routing matches
+	// based on IncomingContext ("server-target") and ignores
+	// OutgoingContext ("client-target" injected by interceptor),
+	// it goes to Route 1 (Deny).
+	matchCtx := metadata.NewOutgoingContext(ctx, metadata.Pairs("x-route", "server-target"))
+	if _, err := client.EmptyCall(matchCtx, &testpb.Empty{}, grpc.WaitForReady(true)); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("EmptyCall() failed with status code %v, want PermissionDenied", status.Code(err))
+	}
+
+	// Make an RPC with no metadata. This verifies that requests missing
+	// the matching header cleanly fall through.
+	if _, err := client.EmptyCall(ctx, &testpb.Empty{}); status.Code(err) != codes.OK {
+		t.Fatalf("EmptyCall() failed with status code %v, want OK", status.Code(err))
+	}
 }

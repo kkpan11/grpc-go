@@ -46,7 +46,7 @@ func (s) TestServer_MaxHandlers(t *testing.T) {
 	// This stub server does not properly respect the stream context, so it will
 	// not exit when the context is canceled.
 	ss := stubserver.StubServer{
-		FullDuplexCallF: func(stream testgrpc.TestService_FullDuplexCallServer) error {
+		FullDuplexCallF: func(testgrpc.TestService_FullDuplexCallServer) error {
 			started <- struct{}{}
 			<-blockCalls.Done()
 			return nil
@@ -111,7 +111,7 @@ func (s) TestServer_MaxHandlers(t *testing.T) {
 func (s) TestStreamWorkers_RPCsAndStop(t *testing.T) {
 	ss := stubserver.StartTestService(t, nil, grpc.NumStreamWorkers(uint32(runtime.NumCPU())))
 	// This deferred stop takes care of stopping the server when one of the
-	// below grpc.Dials fail, and the test exits early.
+	// below grpc.NewClient fail, and the test exits early.
 	defer ss.Stop()
 
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
@@ -195,7 +195,7 @@ func (s) TestServer_WaitForHandlers(t *testing.T) {
 	// This stub server does not properly respect the stream context, so it will
 	// not exit when the context is canceled.
 	ss := stubserver.StubServer{
-		FullDuplexCallF: func(stream testgrpc.TestService_FullDuplexCallServer) error {
+		FullDuplexCallF: func(testgrpc.TestService_FullDuplexCallServer) error {
 			started.Fire()
 			<-blockCalls.Done()
 			return nil
@@ -268,7 +268,7 @@ func (s) TestServer_GracefulStopWaits(t *testing.T) {
 	// This stub server does not properly respect the stream context, so it will
 	// not exit when the context is canceled.
 	ss := stubserver.StubServer{
-		FullDuplexCallF: func(stream testgrpc.TestService_FullDuplexCallServer) error {
+		FullDuplexCallF: func(testgrpc.TestService_FullDuplexCallServer) error {
 			started.Fire()
 			<-blockCalls.Done()
 			return nil

@@ -16,7 +16,8 @@
  *
  */
 
-// Binary client is an example client.
+// Binary client demonstrates how to check and observe gRPC server health using
+// the health library.
 package main
 
 import (
@@ -29,12 +30,12 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	pb "google.golang.org/grpc/examples/features/proto/echo"
-	_ "google.golang.org/grpc/health"
+	_ "google.golang.org/grpc/health" // REQUIRED to enable health checks
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/resolver/manual"
 )
 
-var serviceConfig = `{
+const serviceConfig = `{
 	"loadBalancingPolicy": "round_robin",
 	"healthCheckConfig": {
 		"serviceName": ""
@@ -67,8 +68,8 @@ func main() {
 
 	options := []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
 		grpc.WithResolvers(r),
+		// google.golang.org/grpc/health must also be imported
 		grpc.WithDefaultServiceConfig(serviceConfig),
 	}
 

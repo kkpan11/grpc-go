@@ -28,6 +28,7 @@ import (
 
 	"google.golang.org/grpc/balancer"
 	"google.golang.org/grpc/balancer/weightedtarget/weightedaggregator"
+	"google.golang.org/grpc/experimental/resolver/locality"
 	"google.golang.org/grpc/internal/balancergroup"
 	"google.golang.org/grpc/internal/grpclog"
 	"google.golang.org/grpc/internal/hierarchy"
@@ -62,7 +63,6 @@ func (bb) Build(cc balancer.ClientConn, bOpts balancer.BuildOptions) balancer.Ba
 		Logger:                  b.logger,
 		SubBalancerCloseTimeout: time.Duration(0), // Disable caching of removed child policies
 	})
-	b.bg.Start()
 	b.logger.Infof("Created")
 	return b
 }
@@ -88,12 +88,15 @@ type weightedTargetBalancer struct {
 // creates/deletes sub-balancers and sends them update. addresses are split into
 // groups based on hierarchy path.
 func (b *weightedTargetBalancer) UpdateClientConnState(s balancer.ClientConnState) error {
-	b.logger.Infof("Received update from resolver, balancer config: %+v", pretty.ToJSON(s.BalancerConfig))
+	if b.logger.V(2) {
+		b.logger.Infof("Received update from resolver, balancer config: %+v", pretty.ToJSON(s.BalancerConfig))
+	}
+
 	newConfig, ok := s.BalancerConfig.(*LBConfig)
 	if !ok {
 		return fmt.Errorf("unexpected balancer config with type: %T", s.BalancerConfig)
 	}
-	addressesSplit := hierarchy.Group(s.ResolverState.Addresses)
+	endpointsSplit := hierarchy.Group(s.ResolverState.Endpoints)
 
 	b.stateAggregator.PauseStateUpdates()
 	defer b.stateAggregator.ResumeStateUpdates()
@@ -138,12 +141,13 @@ func (b *weightedTargetBalancer) UpdateClientConnState(s balancer.ClientConnStat
 		// - Balancer config comes from the targets map.
 		//
 		// TODO: handle error? How to aggregate errors and return?
+		rs := resolver.State{
+			Endpoints:     endpointsSplit[name],
+			ServiceConfig: s.ResolverState.ServiceConfig,
+			Attributes:    s.ResolverState.Attributes,
+		}
 		_ = b.bg.UpdateClientConnState(name, balancer.ClientConnState{
-			ResolverState: resolver.State{
-				Addresses:     addressesSplit[name],
-				ServiceConfig: s.ResolverState.ServiceConfig,
-				Attributes:    s.ResolverState.Attributes,
-			},
+			ResolverState:  locality.Set(rs, name),
 			BalancerConfig: newT.ChildPolicy.Config,
 		})
 	}

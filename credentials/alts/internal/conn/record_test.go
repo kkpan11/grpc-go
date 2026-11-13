@@ -26,6 +26,7 @@ import (
 	"math"
 	"net"
 	"reflect"
+	"strings"
 	"testing"
 
 	core "google.golang.org/grpc/credentials/alts/internal"
@@ -188,6 +189,48 @@ func (s) TestLargeMsg(t *testing.T) {
 	}
 }
 
+// TestLargeRecord writes a very large ALTS record and verifies that the server
+// receives it correctly. The large ALTS record should cause the reader to
+// expand it's read buffer to hold the entire record and store the decrypted
+// message until the receiver reads all of the bytes.
+func (s) TestLargeRecord(t *testing.T) {
+	clientConn, serverConn := newConnPair(rekeyRecordProtocol, nil, nil)
+	msg := []byte(strings.Repeat("a", 2*altsReadBufferInitialSize))
+	// Increase the size of ALTS records written by the client.
+	clientConn.payloadLengthLimit = math.MaxInt32
+	if n, err := clientConn.Write(msg); n != len(msg) || err != nil {
+		t.Fatalf("Write() = %v, %v; want %v, <nil>", n, err, len(msg))
+	}
+	rcvMsg := make([]byte, len(msg))
+	if n, err := io.ReadFull(serverConn, rcvMsg); n != len(rcvMsg) || err != nil {
+		t.Fatalf("Read() = %v, %v; want %v, <nil>", n, err, len(rcvMsg))
+	}
+	if !reflect.DeepEqual(msg, rcvMsg) {
+		t.Fatalf("Write()/Server Read() = %v, want %v", rcvMsg, msg)
+	}
+}
+
+// BenchmarkLargeMessage measures the performance of ALTS conns for sending and
+// receiving a large message.
+func BenchmarkLargeMessage(b *testing.B) {
+	msgLen := 20 * 1024 * 1024 // 20 MiB
+	msg := make([]byte, msgLen)
+	rcvMsg := make([]byte, len(msg))
+	b.ResetTimer()
+	clientConn, serverConn := newConnPair(rekeyRecordProtocol, nil, nil)
+	for range b.N {
+		// Write 20 MiB 5 times to transfer a total of 100 MiB.
+		for range 5 {
+			if n, err := clientConn.Write(msg); n != len(msg) || err != nil {
+				b.Fatalf("Write() = %v, %v; want %v, <nil>", n, err, len(msg))
+			}
+			if n, err := io.ReadFull(serverConn, rcvMsg); n != len(rcvMsg) || err != nil {
+				b.Fatalf("Read() = %v, %v; want %v, <nil>", n, err, len(rcvMsg))
+			}
+		}
+	}
+}
+
 func testIncorrectMsgType(t *testing.T, rp string) {
 	// framedMsg is an empty ciphertext with correct framing but wrong
 	// message type.
@@ -248,7 +291,7 @@ func testWriteLargeData(t *testing.T, rp string) {
 	// buffer size.
 	clientConn, serverConn := newConnPair(rp, nil, nil)
 	// Message size is intentionally chosen to not be multiple of
-	// payloadLengthLimtit.
+	// payloadLengthLimit.
 	msgSize := altsWriteBufferMaxSize + (100 * 1024)
 	clientMsg := make([]byte, msgSize)
 	for i := 0; i < msgSize; i++ {
@@ -324,5 +367,197 @@ func testProtectedBuffer(t *testing.T, rp string) {
 func (s) TestProtectedBuffer(t *testing.T) {
 	for _, rp := range recordProtocols {
 		testProtectedBuffer(t, rp)
+	}
+}
+
+// BenchmarkWriteMemoryUsage measures the allocations per ALTS connection.
+// Run this with: go test -bench=BenchmarkWriteMemoryUsage -benchmem
+func BenchmarkWriteMemoryUsage(b *testing.B) {
+	b.ReportAllocs()
+	data := []byte(strings.Repeat("d", 256))
+	key := []byte{
+		// 16 arbitrary bytes.
+		0x1f, 0x8b, 0x08, 0x00, 0x00, 0x09, 0x6e, 0x88, 0x02, 0xff, 0xe2, 0xd2, 0x4c, 0xce, 0x4f, 0x49}
+	conn := &noopConn{}
+
+	for b.Loop() {
+		c, err := NewConn(conn, core.ClientSide, rekeyRecordProtocol, key, nil)
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		if _, err := c.Write(data); err != nil {
+			b.Fatalf("Write failed: %v", err)
+		}
+	}
+}
+
+// BenchmarkReadMemoryUsage measures the allocations per ALTS connection.
+// Run this with: go test -bench=BenchmarkReadMemoryUsage -benchmem
+func BenchmarkReadMemoryUsage(b *testing.B) {
+	b.ReportAllocs()
+	data := []byte(strings.Repeat("d", 257))
+	readBuf := make([]byte, 1024)
+
+	for b.Loop() {
+		clientConn, serverConn := newConnPair(rekeyRecordProtocol, nil, nil)
+		b.StopTimer()
+		clientConn.Write(data)
+		b.StartTimer()
+		if _, err := serverConn.Read(readBuf); err != nil {
+			b.Fatalf("Write failed: %v", err)
+		}
+	}
+}
+
+type noopConn struct {
+	net.Conn
+}
+
+func (c *noopConn) Write(b []byte) (n int, err error) {
+	return len(b), nil
+}
+
+func (c *noopConn) Close() error {
+	return nil
+}
+
+func (s) TestParseFramedMsgVulnerability(t *testing.T) {
+	key := []byte{0x1f, 0x8b, 0x08, 0x00, 0x00, 0x09, 0x6e, 0x88, 0x02, 0xff, 0xe2, 0xd2, 0x4c, 0xce, 0x4f, 0x49}
+	tc := testConn{
+		in:  new(bytes.Buffer),
+		out: new(bytes.Buffer),
+	}
+	// We pass a protected buffer representing a framed message length of 0,
+	// followed by bytes that will act as a dirty buffer capacity. If the capacity
+	// bytes happen to start with `0x06` (altsRecordMsgType), the vulnerable
+	// code will try to slice `msg[4:]` which panics because len(msg) is 0.
+	malformedProtected := []byte{0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00}
+	c, err := NewConn(&tc, core.ServerSide, rekeyRecordProtocol, key, malformedProtected)
+	if err != nil {
+		t.Fatalf("NewConn failed: %v", err)
+	}
+	buf := make([]byte, 1024)
+	const wantErr = "shorter than message type field size"
+	if _, err := c.Read(buf); err == nil || !strings.Contains(err.Error(), wantErr) {
+		t.Fatalf("c.Read(buf) returned error: %v, want error containing %q", err, wantErr)
+	}
+}
+
+// countALTSFrames parses raw ALTS wire bytes and returns the number of complete frames.
+func countALTSFrames(data []byte) int {
+	count := 0
+	for len(data) >= MsgLenFieldSize {
+		frameLen := int(binary.LittleEndian.Uint32(data[:MsgLenFieldSize]))
+		total := MsgLenFieldSize + frameLen
+		if total > len(data) {
+			break
+		}
+		data = data[total:]
+		count++
+	}
+	return count
+}
+
+func (s) TestNewConnNegotiatedMaxFrameSize(t *testing.T) {
+	key := make([]byte, 32)
+
+	for _, tc := range []struct {
+		name                   string
+		negotiatedMaxFrameSize int
+		wantMaxRecordLen       int
+	}{
+		{"NotNegotiated", 0, altsRecordDefaultLength},
+		{"SmallerThanDefault_10B", 10, altsRecordDefaultLength},
+		{"SmallerThanDefault_1024B", 1024, altsRecordDefaultLength},
+		{"Negotiated_4KB", 4 * 1024, 4 * 1024},
+		{"Negotiated_16KB", 16 * 1024, 16 * 1024},
+		{"Negotiated_64KB", 64 * 1024, 64 * 1024},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tcConn := testConn{}
+			c, err := NewConnWithMaxFrameSize(&tcConn, core.ClientSide, rekeyRecordProtocol, key, nil, tc.negotiatedMaxFrameSize)
+			if err != nil {
+				t.Fatalf("NewConn() err = %v, want nil", err)
+			}
+			altsC := c.(*conn)
+			wantPayloadLimit := tc.wantMaxRecordLen - altsC.overhead
+			if altsC.payloadLengthLimit != wantPayloadLimit {
+				t.Errorf("payloadLengthLimit = %v, want %v", altsC.payloadLengthLimit, wantPayloadLimit)
+			}
+		})
+	}
+}
+
+// TestWriteHonorsNegotiatedMaxFrameSize verifies that Write uses the negotiated
+// max_frame_size so we never send a frame larger than negotiated.
+func (s) TestWriteHonorsNegotiatedMaxFrameSize(t *testing.T) {
+	key := make([]byte, 16)
+	const negotiatedMaxFrameSize = 16 * 1024
+	out := new(bytes.Buffer)
+	c, err := NewConnWithMaxFrameSize(&testConn{in: new(bytes.Buffer), out: out}, core.ClientSide, rekeyRecordProtocol, key, nil, negotiatedMaxFrameSize)
+	if err != nil {
+		t.Fatalf("NewConn failed: %v", err)
+	}
+	altsC := c.(*conn)
+	if got, want := altsC.payloadLengthLimit+altsC.overhead, negotiatedMaxFrameSize; got != want {
+		t.Fatalf("frame size = %v, want %v", got, want)
+	}
+	// Two negotiatedMaxFrameSize-worth of plaintext should split into exactly two frames.
+	payload := make([]byte, 2*altsC.payloadLengthLimit)
+	if _, err := c.Write(payload); err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+	if got, want := countALTSFrames(out.Bytes()), 2; got != want {
+		t.Errorf("Write produced %d frames, want %d", got, want)
+	}
+}
+
+type partialWriteTestConn struct {
+	net.Conn
+	maxWriteBytes int
+	err           error
+	out           bytes.Buffer
+}
+
+func (c *partialWriteTestConn) Write(b []byte) (int, error) {
+	if len(b) > c.maxWriteBytes {
+		c.out.Write(b[:c.maxWriteBytes])
+		return c.maxWriteBytes, c.err
+	}
+	c.out.Write(b)
+	return len(b), nil
+}
+
+// TestWritePartialWriteErrorWithNegotiatedMaxFrameSize verifies that when a partial Write error occurs,
+// the number of written bytes returned correctly accounts for the negotiated max_frame_size.
+func (s) TestWritePartialWriteErrorWithNegotiatedMaxFrameSize(t *testing.T) {
+	key := make([]byte, 16)
+	const negotiatedMaxFrameSize = 16 * 1024
+
+	// Allow writing 1.5 frames (16384 + 8192 = 24576 bytes) before returning io.ErrUnexpectedEOF.
+	writeLimit := negotiatedMaxFrameSize + negotiatedMaxFrameSize/2
+	errConn := &partialWriteTestConn{
+		maxWriteBytes: writeLimit,
+		err:           io.ErrUnexpectedEOF,
+	}
+
+	c, err := NewConnWithMaxFrameSize(errConn, core.ClientSide, rekeyRecordProtocol, key, nil, negotiatedMaxFrameSize)
+	if err != nil {
+		t.Fatalf("NewConn failed: %v", err)
+	}
+	altsC := c.(*conn)
+
+	// Send 3 frames worth of payload
+	payload := make([]byte, 3*altsC.payloadLengthLimit)
+	n, writeErr := c.Write(payload)
+	if writeErr != io.ErrUnexpectedEOF {
+		t.Fatalf("Write err = %v, want %v", writeErr, io.ErrUnexpectedEOF)
+	}
+
+	// Exactly 1 complete frame was written before the partial write error.
+	wantWrittenBytes := altsC.payloadLengthLimit
+	if n != wantWrittenBytes {
+		t.Errorf("Write() returned n = %d, want %d", n, wantWrittenBytes)
 	}
 }

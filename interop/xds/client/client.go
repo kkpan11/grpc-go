@@ -279,7 +279,7 @@ func (s *statsService) GetClientStats(ctx context.Context, in *testpb.LoadBalanc
 	}
 }
 
-func (s *statsService) GetClientAccumulatedStats(ctx context.Context, in *testpb.LoadBalancerAccumulatedStatsRequest) (*testpb.LoadBalancerAccumulatedStatsResponse, error) {
+func (s *statsService) GetClientAccumulatedStats(context.Context, *testpb.LoadBalancerAccumulatedStatsRequest) (*testpb.LoadBalancerAccumulatedStatsResponse, error) {
 	return accStats.buildResp(), nil
 }
 
@@ -287,7 +287,7 @@ type configureService struct {
 	testgrpc.UnimplementedXdsUpdateClientConfigureServiceServer
 }
 
-func (s *configureService) Configure(ctx context.Context, in *testpb.ClientConfigureRequest) (*testpb.ClientConfigureResponse, error) {
+func (s *configureService) Configure(_ context.Context, in *testpb.ClientConfigureRequest) (*testpb.ClientConfigureResponse, error) {
 	rpcsToMD := make(map[testpb.ClientConfigureRequest_RpcType][]string)
 	for _, typ := range in.GetTypes() {
 		rpcsToMD[typ] = nil
@@ -437,9 +437,9 @@ func main() {
 
 	clients := make([]testgrpc.TestServiceClient, *numChannels)
 	for i := 0; i < *numChannels; i++ {
-		conn, err := grpc.Dial(*server, grpc.WithTransportCredentials(creds))
+		conn, err := grpc.NewClient(*server, grpc.WithTransportCredentials(creds))
 		if err != nil {
-			logger.Fatalf("Fail to dial: %v", err)
+			logger.Fatalf("grpc.NewClient(%q) = %v", *server, err)
 		}
 		defer conn.Close()
 		clients[i] = testgrpc.NewTestServiceClient(conn)

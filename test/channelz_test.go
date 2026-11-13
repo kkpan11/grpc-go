@@ -304,11 +304,11 @@ func (s) TestCZTopChannelRegistrationAndDeletion(t *testing.T) {
 	}
 }
 
-func (s) TestCZTopChannelRegistrationAndDeletionWhenDialFail(t *testing.T) {
-	// Make dial fails (due to no transport security specified)
+func (s) TestCZTopChannelRegistrationAndDeletionWhenNewClientFail(t *testing.T) {
+	// Make newclient fails (due to no transport security specified)
 	_, err := grpc.NewClient("fake.addr")
 	if err == nil {
-		t.Fatal("expecting dial to fail")
+		t.Fatal("expecting newclient to fail")
 	}
 	if tcs, end := channelz.GetTopChannels(0, 0); tcs != nil || !end {
 		t.Fatalf("GetTopChannels(0, 0) = %v, %v, want <nil>, true", tcs, end)
@@ -548,7 +548,7 @@ func (s) TestCZServerListenSocketDeletion(t *testing.T) {
 	s.Stop()
 }
 
-func (s) TestCZRecusivelyDeletionOfEntry(t *testing.T) {
+func (s) TestCZRecursiveDeletionOfEntry(t *testing.T) {
 	//           +--+TopChan+---+
 	//           |              |
 	//           v              v
@@ -1086,7 +1086,7 @@ func (s) TestCZClientAndServerSocketMetricsStreamsCountFlowControlRSTStream(t *t
 	go func() {
 		payload := make([]byte, 16384)
 		for i := 0; i < 6; i++ {
-			dw.getRawConnWrapper().writeRawFrame(http2.FrameData, 0, tc.getCurrentStreamID(), payload)
+			dw.getRawConnWrapper().writeDataFrame(tc.getCurrentStreamID(), payload)
 		}
 	}()
 	if _, err := stream.Recv(); status.Code(err) != codes.ResourceExhausted {
@@ -1525,7 +1525,7 @@ func (s) TestCZChannelTraceCreationDeletion(t *testing.T) {
 		trace := tcs[0].Trace()
 		for _, e := range trace.Events {
 			if e.RefID == nestedConn && e.RefType != channelz.RefChannel {
-				return false, fmt.Errorf("nested channel trace event shoud have RefChannel as RefType")
+				return false, fmt.Errorf("nested channel trace event should have RefChannel as RefType")
 			}
 		}
 		ncm := channelz.GetChannel(nestedConn)
@@ -1608,7 +1608,7 @@ func (s) TestCZSubChannelTraceCreationDeletion(t *testing.T) {
 		trace := tcs[0].Trace()
 		for _, e := range trace.Events {
 			if e.RefID == subConn && e.RefType != channelz.RefSubChannel {
-				return false, fmt.Errorf("subchannel trace event shoud have RefType to be RefSubChannel")
+				return false, fmt.Errorf("subchannel trace event should have RefType to be RefSubChannel")
 			}
 		}
 		scm := channelz.GetSubChannel(subConn)
@@ -1989,7 +1989,7 @@ func (s) TestCZChannelConnectivityState(t *testing.T) {
 
 		// example:
 		// Channel Created
-		// Adressses resolved (from empty address state): "localhost:40467"
+		// Addresses resolved (from empty address state): "localhost:40467"
 		// SubChannel (id: 4[]) Created
 		// Channel's connectivity state changed to CONNECTING
 		// Channel's connectivity state changed to READY

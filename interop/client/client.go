@@ -28,6 +28,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"flag"
+	"log"
 	"net"
 	"os"
 	"strconv"
@@ -47,9 +48,9 @@ import (
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/testdata"
 
-	_ "google.golang.org/grpc/balancer/grpclb"      // Register the grpclb load balancing policy.
-	_ "google.golang.org/grpc/balancer/rls"         // Register the RLS load balancing policy.
-	_ "google.golang.org/grpc/xds/googledirectpath" // Register xDS resolver required for c2p directpath.
+	_ "google.golang.org/grpc/balancer/grpclb"    // Register the grpclb load balancing policy.
+	_ "google.golang.org/grpc/balancer/rls"       // Register the RLS load balancing policy.
+	"google.golang.org/grpc/xds/googledirectpath" // Register xDS resolver required for c2p directpath.
 
 	testgrpc "google.golang.org/grpc/interop/grpc_testing"
 )
@@ -60,7 +61,7 @@ const (
 )
 
 var (
-	caFile                                 = flag.String("ca_file", "", "The file containning the CA root cert file")
+	caFile                                 = flag.String("ca_file", "", "The file containing the CA root cert file")
 	useTLS                                 = flag.Bool("use_tls", false, "Connection uses TLS if true")
 	useALTS                                = flag.Bool("use_alts", false, "Connection uses ALTS if true (this option can only be used on GCP)")
 	customCredentialsType                  = flag.String("custom_credentials_type", "", "Custom creds to use, excluding TLS or ALTS")
@@ -69,6 +70,7 @@ var (
 	serviceAccountKeyFile                  = flag.String("service_account_key_file", "", "Path to service account json key file")
 	oauthScope                             = flag.String("oauth_scope", "", "The scope for OAuth2 tokens")
 	defaultServiceAccount                  = flag.String("default_service_account", "", "Email of GCE default service account")
+	googleC2PUniverseDomain                = flag.String("google_c2p_universe_domain", "", "Universe domain for google-c2p resolve")
 	serverHost                             = flag.String("server_host", "localhost", "The server host name")
 	serverPort                             = flag.Int("server_port", 10000, "The server port number")
 	serviceConfigJSON                      = flag.String("service_config_json", "", "Disables service config lookups and sets the provided string as the default service config.")
@@ -79,6 +81,7 @@ var (
 	soakMinTimeMsBetweenRPCs               = flag.Int("soak_min_time_ms_between_rpcs", 0, "The minimum time in milliseconds between consecutive RPCs in a soak test (rpc_soak or channel_soak), useful for limiting QPS")
 	soakRequestSize                        = flag.Int("soak_request_size", 271828, "The request size in a soak RPC. The default value is set based on the interop large unary test case.")
 	soakResponseSize                       = flag.Int("soak_response_size", 314159, "The response size in a soak RPC. The default value is set based on the interop large unary test case.")
+	soakNumThreads                         = flag.Int("soak_num_threads", 1, "The number of threads for concurrent execution of the soak tests (rpc_soak or channel_soak). The default value is set based on the interop large unary test case.")
 	tlsServerName                          = flag.String("server_host_override", "", "The server name used to verify the hostname returned by TLS handshake if it is not empty. Otherwise, --server_host is used.")
 	additionalMetadata                     = flag.String("additional_metadata", "", "Additional metadata to send in each request, as a semicolon-separated list of key:value pairs.")
 	testCase                               = flag.String("test_case", "large_unary",
@@ -121,6 +124,26 @@ const (
 	credsComputeEngineCreds
 )
 
+// tlsBundle is a credentials.Bundle that combines TLS transport credentials
+// with per-RPC credentials. It always uses the same TLS transport credentials,
+// regardless of mode.
+type tlsBundle struct {
+	transportCreds credentials.TransportCredentials
+	perRPCCreds    credentials.PerRPCCredentials
+}
+
+func (b *tlsBundle) TransportCredentials() credentials.TransportCredentials {
+	return b.transportCreds
+}
+
+func (b *tlsBundle) PerRPCCredentials() credentials.PerRPCCredentials {
+	return b.perRPCCreds
+}
+
+func (b *tlsBundle) NewWithMode(string) (credentials.Bundle, error) {
+	return &tlsBundle{transportCreds: b.transportCreds.Clone(), perRPCCreds: b.perRPCCreds}, nil
+}
+
 // Parses the --additional_metadata flag and returns metadata to send on each RPC,
 // formatted as per https://pkg.go.dev/google.golang.org/grpc/metadata#Pairs.
 // Allow any character but semicolons in values. If the flag is empty, return a nil map.
@@ -147,6 +170,21 @@ func parseAdditionalMetadataFlag() []string {
 		r = r[i+1:]
 	}
 	return addMd
+}
+
+// createSoakTestConfig creates a shared configuration structure for soak tests.
+func createBaseSoakConfig(serverAddr string) interop.SoakTestConfig {
+	return interop.SoakTestConfig{
+		RequestSize:                      *soakRequestSize,
+		ResponseSize:                     *soakResponseSize,
+		PerIterationMaxAcceptableLatency: time.Duration(*soakPerIterationMaxAcceptableLatencyMs) * time.Millisecond,
+		MinTimeBetweenRPCs:               time.Duration(*soakMinTimeMsBetweenRPCs) * time.Millisecond,
+		OverallTimeout:                   time.Duration(*soakOverallTimeoutSeconds) * time.Second,
+		ServerAddr:                       serverAddr,
+		NumWorkers:                       *soakNumThreads,
+		Iterations:                       *soakIterations,
+		MaxFailures:                      *soakMaxFailures,
+	}
 }
 
 func main() {
@@ -184,11 +222,19 @@ func main() {
 	}
 
 	resolver.SetDefaultScheme("dns")
+	if len(*googleC2PUniverseDomain) > 0 {
+		if err := googledirectpath.SetUniverseDomain(*googleC2PUniverseDomain); err != nil {
+			log.Fatalf("googlec2p.SetUniverseDomain(%s) failed: %v", *googleC2PUniverseDomain, err)
+		}
+	}
 	serverAddr := *serverHost
 	if *serverPort != 0 {
 		serverAddr = net.JoinHostPort(*serverHost, strconv.Itoa(*serverPort))
 	}
 	var opts []grpc.DialOption
+	// tlsCreds is set when TLS is chosen. The dial option for it is added
+	// below, once the per-RPC credentials for the test case are known.
+	var tlsCreds credentials.TransportCredentials
 	switch credsChosen {
 	case credsTLS:
 		var roots *x509.CertPool
@@ -205,13 +251,11 @@ func main() {
 				logger.Fatalf("Failed to append certificates: %s", string(b))
 			}
 		}
-		var creds credentials.TransportCredentials
 		if *tlsServerName != "" {
-			creds = credentials.NewClientTLSFromCert(roots, *tlsServerName)
+			tlsCreds = credentials.NewClientTLSFromCert(roots, *tlsServerName)
 		} else {
-			creds = credentials.NewTLS(&tls.Config{RootCAs: roots})
+			tlsCreds = credentials.NewTLS(&tls.Config{RootCAs: roots})
 		}
-		opts = append(opts, grpc.WithTransportCredentials(creds))
 	case credsALTS:
 		altsOpts := alts.DefaultClientOptions()
 		if *altsHSAddr != "" {
@@ -229,22 +273,32 @@ func main() {
 		logger.Fatal("Invalid creds")
 	}
 	if credsChosen == credsTLS {
+		var perRPCCreds credentials.PerRPCCredentials
 		if *testCase == "compute_engine_creds" {
-			opts = append(opts, grpc.WithPerRPCCredentials(oauth.NewComputeEngine()))
+			perRPCCreds = oauth.NewComputeEngine()
 		} else if *testCase == "service_account_creds" {
 			jwtCreds, err := oauth.NewServiceAccountFromFile(*serviceAccountKeyFile, *oauthScope)
 			if err != nil {
 				logger.Fatalf("Failed to create JWT credentials: %v", err)
 			}
-			opts = append(opts, grpc.WithPerRPCCredentials(jwtCreds))
+			perRPCCreds = jwtCreds
 		} else if *testCase == "jwt_token_creds" {
 			jwtCreds, err := oauth.NewJWTAccessFromFile(*serviceAccountKeyFile)
 			if err != nil {
 				logger.Fatalf("Failed to create JWT credentials: %v", err)
 			}
-			opts = append(opts, grpc.WithPerRPCCredentials(jwtCreds))
+			perRPCCreds = jwtCreds
 		} else if *testCase == "oauth2_auth_token" {
-			opts = append(opts, grpc.WithPerRPCCredentials(oauth.TokenSource{TokenSource: oauth2.StaticTokenSource(interop.GetToken(ctx, *serviceAccountKeyFile, *oauthScope))}))
+			perRPCCreds = oauth.TokenSource{TokenSource: oauth2.StaticTokenSource(interop.GetToken(ctx, *serviceAccountKeyFile, *oauthScope))}
+		}
+		if perRPCCreds != nil {
+			// Attach the per-RPC credentials to the channel credentials rather
+			// than using grpc.WithPerRPCCredentials, so that channels created
+			// on behalf of this channel (such as the RLS control channel)
+			// inherit them as well.
+			opts = append(opts, grpc.WithCredentialsBundle(&tlsBundle{transportCreds: tlsCreds, perRPCCreds: perRPCCreds}))
+		} else {
+			opts = append(opts, grpc.WithTransportCredentials(tlsCreds))
 		}
 	}
 	if len(*serviceConfigJSON) > 0 {
@@ -261,9 +315,9 @@ func main() {
 		}
 		opts = append(opts, grpc.WithUnaryInterceptor(unaryAddMd), grpc.WithStreamInterceptor(streamingAddMd))
 	}
-	conn, err := grpc.Dial(serverAddr, opts...)
+	conn, err := grpc.NewClient(serverAddr, opts...)
 	if err != nil {
-		logger.Fatalf("Fail to dial: %v", err)
+		logger.Fatalf("grpc.NewClient(%q) = %v", serverAddr, err)
 	}
 	defer conn.Close()
 	tc := testgrpc.NewTestServiceClient(conn)
@@ -358,10 +412,20 @@ func main() {
 		interop.DoPickFirstUnary(ctx, tc)
 		logger.Infoln("PickFirstUnary done")
 	case "rpc_soak":
-		interop.DoSoakTest(ctxWithDeadline, tc, serverAddr, opts, false /* resetChannel */, *soakIterations, *soakMaxFailures, *soakRequestSize, *soakResponseSize, time.Duration(*soakPerIterationMaxAcceptableLatencyMs)*time.Millisecond, time.Duration(*soakMinTimeMsBetweenRPCs)*time.Millisecond)
+		rpcSoakConfig := createBaseSoakConfig(serverAddr)
+		rpcSoakConfig.ChannelForTest = func() (*grpc.ClientConn, func()) { return conn, func() {} }
+		interop.DoSoakTest(ctxWithDeadline, rpcSoakConfig)
 		logger.Infoln("RpcSoak done")
 	case "channel_soak":
-		interop.DoSoakTest(ctxWithDeadline, tc, serverAddr, opts, true /* resetChannel */, *soakIterations, *soakMaxFailures, *soakRequestSize, *soakResponseSize, time.Duration(*soakPerIterationMaxAcceptableLatencyMs)*time.Millisecond, time.Duration(*soakMinTimeMsBetweenRPCs)*time.Millisecond)
+		channelSoakConfig := createBaseSoakConfig(serverAddr)
+		channelSoakConfig.ChannelForTest = func() (*grpc.ClientConn, func()) {
+			cc, err := grpc.NewClient(serverAddr, opts...)
+			if err != nil {
+				log.Fatalf("Failed to create shared channel: %v", err)
+			}
+			return cc, func() { cc.Close() }
+		}
+		interop.DoSoakTest(ctxWithDeadline, channelSoakConfig)
 		logger.Infoln("ChannelSoak done")
 	case "orca_per_rpc":
 		interop.DoORCAPerRPCTest(ctx, tc)

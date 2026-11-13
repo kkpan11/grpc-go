@@ -87,7 +87,7 @@ func (s) TestSuccessfulFirstUpdate(t *testing.T) {
 // TestTwoBalancersSameType tests the scenario where there is a graceful switch
 // load balancer setup with a current and pending load balancer of the same
 // type. Any ClientConn update should be forwarded to the current lb if there is
-// a current lb and no pending lb, and the only the pending lb if the graceful
+// a current lb and no pending lb, and only the pending lb if the graceful
 // switch balancer contains both a current lb and a pending lb. The pending load
 // balancer should also swap into current whenever it updates with a
 // connectivity state other than CONNECTING.
@@ -604,7 +604,7 @@ func (s) TestPendingReplacedByAnotherPending(t *testing.T) {
 	if err != nil {
 		t.Fatalf("error constructing newSubConn in gsb: %v", err)
 	}
-	// This picker never returns an error, which can help this this test verify
+	// This picker never returns an error, which can help this test verify
 	// whether this cached state will get cleared on a new pending balancer
 	// (will replace it with a picker that always errors).
 	pendBal.updateState(balancer.State{
@@ -666,13 +666,13 @@ func (s) TestPendingReplacedByAnotherPending(t *testing.T) {
 // Picker which never errors here for test purposes (can fill up tests further up with this)
 type neverErrPicker struct{}
 
-func (p *neverErrPicker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
+func (p *neverErrPicker) Pick(balancer.PickInfo) (balancer.PickResult, error) {
 	return balancer.PickResult{}, nil
 }
 
 // TestUpdateSubConnStateRace tests the race condition when the graceful switch
 // load balancer receives a SubConnUpdate concurrently with an UpdateState()
-// call, which can cause the balancer to forward the update to to be closed and
+// call, which can cause the balancer to forward the update to be closed and
 // cleared. The balancer API guarantees to never call any method the balancer
 // after a Close() call, and the test verifies that doesn't happen within the
 // graceful switch load balancer.
@@ -725,7 +725,7 @@ func (s) TestUpdateSubConnStateRace(t *testing.T) {
 }
 
 // TestInlineCallbackInBuild tests the scenario where a balancer calls back into
-// the balancer.ClientConn API inline from it's build function.
+// the balancer.ClientConn API inline from its build function.
 func (s) TestInlineCallbackInBuild(t *testing.T) {
 	tcc, gsb := setup(t)
 	// This build call should cause all of the inline updates to forward to the
@@ -795,9 +795,7 @@ func (s) TestInlineCallbackInBuild(t *testing.T) {
 	}
 }
 
-// TestExitIdle tests the ExitIdle operation on the Graceful Switch Balancer for
-// both possible codepaths, one where the child implements ExitIdler interface
-// and one where the child doesn't implement ExitIdler interface.
+// TestExitIdle tests the ExitIdle operation on the Graceful Switch Balancer.
 func (s) TestExitIdle(t *testing.T) {
 	_, gsb := setup(t)
 	// switch to a balancer that implements ExitIdle{} (will populate current).
@@ -811,22 +809,6 @@ func (s) TestExitIdle(t *testing.T) {
 	if err := currBal.waitForExitIdle(ctx); err != nil {
 		t.Fatal(err)
 	}
-
-	// switch to a balancer that doesn't implement ExitIdle{} (will populate
-	// pending).
-	gsb.SwitchTo(verifyBalancerBuilder{})
-	// call exitIdle concurrently with newSubConn to make sure there is not a
-	// data race.
-	done := make(chan struct{})
-	go func() {
-		gsb.ExitIdle()
-		close(done)
-	}()
-	pendBal := gsb.balancerPending.Balancer.(*verifyBalancer)
-	for i := 0; i < 10; i++ {
-		pendBal.newSubConn([]resolver.Address{}, balancer.NewSubConnOptions{})
-	}
-	<-done
 }
 
 const balancerName1 = "mock_balancer_1"
@@ -836,7 +818,7 @@ const buildCallbackBalName = "callbackInBuildBalancer"
 
 type mockBalancerBuilder1 struct{}
 
-func (mockBalancerBuilder1) Build(cc balancer.ClientConn, opts balancer.BuildOptions) balancer.Balancer {
+func (mockBalancerBuilder1) Build(cc balancer.ClientConn, _ balancer.BuildOptions) balancer.Balancer {
 	return &mockBalancer{
 		ccsCh:         testutils.NewChannel(),
 		scStateCh:     testutils.NewChannel(),
@@ -969,7 +951,7 @@ func (mb1 *mockBalancer) updateAddresses(sc balancer.SubConn, addrs []resolver.A
 
 type mockBalancerBuilder2 struct{}
 
-func (mockBalancerBuilder2) Build(cc balancer.ClientConn, opts balancer.BuildOptions) balancer.Balancer {
+func (mockBalancerBuilder2) Build(cc balancer.ClientConn, _ balancer.BuildOptions) balancer.Balancer {
 	return &mockBalancer{
 		ccsCh:         testutils.NewChannel(),
 		scStateCh:     testutils.NewChannel(),
@@ -985,7 +967,7 @@ func (mockBalancerBuilder2) Name() string {
 
 type verifyBalancerBuilder struct{}
 
-func (verifyBalancerBuilder) Build(cc balancer.ClientConn, opts balancer.BuildOptions) balancer.Balancer {
+func (verifyBalancerBuilder) Build(cc balancer.ClientConn, _ balancer.BuildOptions) balancer.Balancer {
 	return &verifyBalancer{
 		closed: grpcsync.NewEvent(),
 		cc:     cc,
@@ -1006,11 +988,13 @@ type verifyBalancer struct {
 	t *testing.T
 }
 
-func (vb *verifyBalancer) UpdateClientConnState(ccs balancer.ClientConnState) error {
+func (vb *verifyBalancer) UpdateClientConnState(balancer.ClientConnState) error {
 	return nil
 }
 
-func (vb *verifyBalancer) ResolverError(err error) {}
+func (vb *verifyBalancer) ExitIdle() {}
+
+func (vb *verifyBalancer) ResolverError(error) {}
 
 func (vb *verifyBalancer) UpdateSubConnState(sc balancer.SubConn, state balancer.SubConnState) {
 	panic(fmt.Sprintf("UpdateSubConnState(%v, %+v) called unexpectedly", sc, state))
@@ -1034,7 +1018,7 @@ func (vb *verifyBalancer) newSubConn(addrs []resolver.Address, opts balancer.New
 
 type buildCallbackBalancerBuilder struct{}
 
-func (buildCallbackBalancerBuilder) Build(cc balancer.ClientConn, opts balancer.BuildOptions) balancer.Balancer {
+func (buildCallbackBalancerBuilder) Build(cc balancer.ClientConn, _ balancer.BuildOptions) balancer.Balancer {
 	b := &buildCallbackBal{
 		cc:      cc,
 		closeCh: testutils.NewChannel(),
@@ -1062,11 +1046,13 @@ type buildCallbackBal struct {
 	closeCh *testutils.Channel
 }
 
-func (bcb *buildCallbackBal) UpdateClientConnState(ccs balancer.ClientConnState) error {
+func (bcb *buildCallbackBal) UpdateClientConnState(balancer.ClientConnState) error {
 	return nil
 }
 
-func (bcb *buildCallbackBal) ResolverError(err error) {}
+func (bcb *buildCallbackBal) ResolverError(error) {}
+
+func (bcb *buildCallbackBal) ExitIdle() {}
 
 func (bcb *buildCallbackBal) UpdateSubConnState(sc balancer.SubConn, state balancer.SubConnState) {
 	panic(fmt.Sprintf("UpdateSubConnState(%v, %+v) called unexpectedly", sc, state))

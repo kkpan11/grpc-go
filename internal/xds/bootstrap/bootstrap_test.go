@@ -28,10 +28,14 @@ import (
 	v3corepb "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	"github.com/google/go-cmp/cmp"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/jwt"
 	"google.golang.org/grpc/credentials/tls/certprovider"
 	"google.golang.org/grpc/internal"
 	"google.golang.org/grpc/internal/envconfig"
 	"google.golang.org/grpc/internal/grpctest"
+	"google.golang.org/grpc/internal/testutils"
+	xdscreds "google.golang.org/grpc/internal/xds/credentials"
 	"google.golang.org/grpc/xds/bootstrap"
 	"google.golang.org/protobuf/testing/protocmp"
 	"google.golang.org/protobuf/types/known/structpb"
@@ -196,6 +200,90 @@ var (
 				"server_features" : ["ignore_resource_deletion", "xds_v3"]
 			}]
 		}`,
+		// example data seeded from
+		// https://github.com/istio/istio/blob/877e8df49d7ead6040ae812ae03ce1bad9ea2bfb/pkg/istio-agent/testdata/grpc-bootstrap.json
+		"istioStyleInsecureWithJWTCallCreds": `
+		{
+			"node": {
+                "id": "sidecar~127.0.0.1~pod1.fake-namespace~fake-namespace.svc.cluster.local",
+                "metadata": {
+                  "GENERATOR": "grpc",
+                  "INSTANCE_IPS": "127.0.0.1",
+                  "ISTIO_VERSION": "1.26.2",
+                  "WORKLOAD_IDENTITY_SOCKET_FILE": "socket"
+                },
+                "locality": {}
+			},
+			"xds_servers" : [{
+				"server_uri": "unix:///etc/istio/XDS",
+				"channel_creds": [
+					{ "type": "insecure" }
+				],
+				"call_creds": [
+					{ "type": "jwt_token_file", "config": {"jwt_token_file": "/var/run/secrets/tokens/istio-token"} }
+				],
+				"server_features" : ["xds_v3"]
+			}]
+		}`,
+		"istioStyleInsecureWithoutCallCreds": `
+		{
+			"node": {
+                "id": "sidecar~127.0.0.1~pod1.fake-namespace~fake-namespace.svc.cluster.local",
+                "metadata": {
+                  "GENERATOR": "grpc",
+                  "INSTANCE_IPS": "127.0.0.1",
+                  "ISTIO_VERSION": "1.26.2",
+                  "WORKLOAD_IDENTITY_SOCKET_FILE": "socket"
+                },
+                "locality": {}
+			},
+			"xds_servers" : [{
+				"server_uri": "unix:///etc/istio/XDS",
+				"channel_creds": [
+					{ "type": "insecure" }
+				],
+				"server_features" : ["xds_v3"]
+			}]
+		}`,
+		"istioStyleWithTLSAndJWT": `
+		{
+			"node": {
+                "id": "sidecar~127.0.0.1~pod1.fake-namespace~fake-namespace.svc.cluster.local",
+                "metadata": {
+                  "GENERATOR": "grpc",
+                  "INSTANCE_IPS": "127.0.0.1",
+                  "ISTIO_VERSION": "1.26.2",
+                  "WORKLOAD_IDENTITY_SOCKET_FILE": "socket"
+                },
+                "locality": {}
+			},
+			"xds_servers" : [{
+				"server_uri": "unix:///etc/istio/XDS",
+				"channel_creds": [
+					{ "type": "tls", "config": {} }
+				],
+				"call_creds": [
+					{ "type": "jwt_token_file", "config": {"jwt_token_file": "/var/run/secrets/tokens/istio-token"} }
+				],
+				"server_features" : ["xds_v3"]
+			}]
+		}`,
+		"serverSupportsTrustedXDSServer": `
+		{
+			"node": {
+				"id": "ENVOY_NODE_ID",
+				"metadata": {
+				    "TRAFFICDIRECTOR_GRPC_HOSTNAME": "trafficdirector"
+			    }
+			},
+			"xds_servers" : [{
+				"server_uri": "trafficdirector.googleapis.com:443",
+				"channel_creds": [
+					{ "type": "google_default" }
+				],
+				"server_features" : ["trusted_xds_server", "xds_v3"]
+			}]
+		}`,
 	}
 	metadata = &structpb.Struct{
 		Fields: map[string]*structpb.Value{
@@ -213,29 +301,29 @@ var (
 	}
 	configWithInsecureCreds = &Config{
 		xDSServers: []*ServerConfig{{
-			serverURI:     "trafficdirector.googleapis.com:443",
-			channelCreds:  []ChannelCreds{{Type: "insecure"}},
-			selectedCreds: ChannelCreds{Type: "insecure"},
+			serverURI:            "trafficdirector.googleapis.com:443",
+			channelCreds:         []ChannelCredsConfig{{Type: "insecure"}},
+			selectedChannelCreds: ChannelCredsConfig{Type: "insecure"},
 		}},
 		node: v3Node,
 		clientDefaultListenerResourceNameTemplate: "%s",
 	}
 	configWithMultipleChannelCredsAndV3 = &Config{
 		xDSServers: []*ServerConfig{{
-			serverURI:      "trafficdirector.googleapis.com:443",
-			channelCreds:   []ChannelCreds{{Type: "not-google-default"}, {Type: "google_default"}},
-			serverFeatures: []string{"xds_v3"},
-			selectedCreds:  ChannelCreds{Type: "google_default"},
+			serverURI:            "trafficdirector.googleapis.com:443",
+			channelCreds:         []ChannelCredsConfig{{Type: "not-google-default"}, {Type: "google_default"}},
+			serverFeatures:       []string{"xds_v3"},
+			selectedChannelCreds: ChannelCredsConfig{Type: "google_default"},
 		}},
 		node: v3Node,
 		clientDefaultListenerResourceNameTemplate: "%s",
 	}
 	configWithGoogleDefaultCredsAndV3 = &Config{
 		xDSServers: []*ServerConfig{{
-			serverURI:      "trafficdirector.googleapis.com:443",
-			channelCreds:   []ChannelCreds{{Type: "google_default"}},
-			serverFeatures: []string{"xds_v3"},
-			selectedCreds:  ChannelCreds{Type: "google_default"},
+			serverURI:            "trafficdirector.googleapis.com:443",
+			channelCreds:         []ChannelCredsConfig{{Type: "google_default"}},
+			serverFeatures:       []string{"xds_v3"},
+			selectedChannelCreds: ChannelCredsConfig{Type: "google_default"},
 		}},
 		node: v3Node,
 		clientDefaultListenerResourceNameTemplate: "%s",
@@ -243,15 +331,15 @@ var (
 	configWithMultipleServers = &Config{
 		xDSServers: []*ServerConfig{
 			{
-				serverURI:      "trafficdirector.googleapis.com:443",
-				channelCreds:   []ChannelCreds{{Type: "google_default"}},
-				serverFeatures: []string{"xds_v3"},
-				selectedCreds:  ChannelCreds{Type: "google_default"},
+				serverURI:            "trafficdirector.googleapis.com:443",
+				channelCreds:         []ChannelCredsConfig{{Type: "google_default"}},
+				serverFeatures:       []string{"xds_v3"},
+				selectedChannelCreds: ChannelCredsConfig{Type: "google_default"},
 			},
 			{
-				serverURI:     "backup.never.use.com:1234",
-				channelCreds:  []ChannelCreds{{Type: "google_default"}},
-				selectedCreds: ChannelCreds{Type: "google_default"},
+				serverURI:            "backup.never.use.com:1234",
+				channelCreds:         []ChannelCredsConfig{{Type: "google_default"}},
+				selectedChannelCreds: ChannelCredsConfig{Type: "google_default"},
 			},
 		},
 		node: v3Node,
@@ -259,21 +347,67 @@ var (
 	}
 	configWithGoogleDefaultCredsAndIgnoreResourceDeletion = &Config{
 		xDSServers: []*ServerConfig{{
-			serverURI:      "trafficdirector.googleapis.com:443",
-			channelCreds:   []ChannelCreds{{Type: "google_default"}},
-			serverFeatures: []string{"ignore_resource_deletion", "xds_v3"},
-			selectedCreds:  ChannelCreds{Type: "google_default"},
+			serverURI:            "trafficdirector.googleapis.com:443",
+			channelCreds:         []ChannelCredsConfig{{Type: "google_default"}},
+			serverFeatures:       []string{"ignore_resource_deletion", "xds_v3"},
+			selectedChannelCreds: ChannelCredsConfig{Type: "google_default"},
+		}},
+		node: v3Node,
+		clientDefaultListenerResourceNameTemplate: "%s",
+	}
+	configWithGoogleDefaultCredsAndTrustedXDSServer = &Config{
+		xDSServers: []*ServerConfig{{
+			serverURI:            "trafficdirector.googleapis.com:443",
+			channelCreds:         []ChannelCredsConfig{{Type: "google_default"}},
+			serverFeatures:       []string{"trusted_xds_server", "xds_v3"},
+			selectedChannelCreds: ChannelCredsConfig{Type: "google_default"},
 		}},
 		node: v3Node,
 		clientDefaultListenerResourceNameTemplate: "%s",
 	}
 	configWithGoogleDefaultCredsAndNoServerFeatures = &Config{
 		xDSServers: []*ServerConfig{{
-			serverURI:     "trafficdirector.googleapis.com:443",
-			channelCreds:  []ChannelCreds{{Type: "google_default"}},
-			selectedCreds: ChannelCreds{Type: "google_default"},
+			serverURI:            "trafficdirector.googleapis.com:443",
+			channelCreds:         []ChannelCredsConfig{{Type: "google_default"}},
+			selectedChannelCreds: ChannelCredsConfig{Type: "google_default"},
 		}},
 		node: v3Node,
+		clientDefaultListenerResourceNameTemplate: "%s",
+	}
+
+	istioNodeMetadata = &structpb.Struct{
+		Fields: map[string]*structpb.Value{
+			"GENERATOR": {
+				Kind: &structpb.Value_StringValue{StringValue: "grpc"},
+			},
+			"INSTANCE_IPS": {
+				Kind: &structpb.Value_StringValue{StringValue: "127.0.0.1"},
+			},
+			"ISTIO_VERSION": {
+				Kind: &structpb.Value_StringValue{StringValue: "1.26.2"},
+			},
+			"WORKLOAD_IDENTITY_SOCKET_FILE": {
+				Kind: &structpb.Value_StringValue{StringValue: "socket"},
+			},
+		},
+	}
+	jwtCallCreds, _                 = jwt.NewTokenFileCallCredentials("/var/run/secrets/tokens/istio-token")
+	selectedJWTCallCreds            = []credentials.PerRPCCredentials{jwtCallCreds}
+	configWithIstioStyleNoCallCreds = &Config{
+		xDSServers: []*ServerConfig{{
+			serverURI:            "unix:///etc/istio/XDS",
+			channelCreds:         []ChannelCredsConfig{{Type: "insecure"}},
+			serverFeatures:       []string{"xds_v3"},
+			selectedChannelCreds: ChannelCredsConfig{Type: "insecure"},
+		}},
+		node: node{
+			ID:                   "sidecar~127.0.0.1~pod1.fake-namespace~fake-namespace.svc.cluster.local",
+			Metadata:             istioNodeMetadata,
+			userAgentName:        gRPCUserAgentName,
+			userAgentVersionType: userAgentVersion{UserAgentVersion: grpc.Version},
+			clientFeatures:       []string{clientFeatureNoOverprovisioning, clientFeatureResourceWrapper},
+		},
+		certProviderConfigs:                       map[string]*certprovider.BuildableConfig{},
 		clientDefaultListenerResourceNameTemplate: "%s",
 	}
 )
@@ -293,19 +427,16 @@ func setupBootstrapOverride(bootstrapFileMap map[string]string) func() {
 	return func() { bootstrapFileReadFunc = oldFileReadFunc }
 }
 
-// TODO: enable leak check for this package when
-// https://github.com/googleapis/google-cloud-go/issues/2417 is fixed.
-
 // This function overrides the bootstrap file NAME env variable, to test the
 // code that reads file with the given fileName.
-func testNewConfigWithFileNameEnv(t *testing.T, fileName string, wantError bool, wantConfig *Config) {
+func testGetConfigurationWithFileNameEnv(t *testing.T, fileName string, wantError bool, wantConfig *Config) {
 	origBootstrapFileName := envconfig.XDSBootstrapFileName
 	envconfig.XDSBootstrapFileName = fileName
 	defer func() { envconfig.XDSBootstrapFileName = origBootstrapFileName }()
 
-	c, err := NewConfig()
+	c, err := GetConfiguration()
 	if (err != nil) != wantError {
-		t.Fatalf("NewConfig() returned error %v, wantError: %v", err, wantError)
+		t.Fatalf("GetConfiguration() returned error %v, wantError: %v", err, wantError)
 	}
 	if wantError {
 		return
@@ -317,7 +448,7 @@ func testNewConfigWithFileNameEnv(t *testing.T, fileName string, wantError bool,
 
 // This function overrides the bootstrap file CONTENT env variable, to test the
 // code that uses the content from env directly.
-func testNewConfigWithFileContentEnv(t *testing.T, fileName string, wantError bool, wantConfig *Config) {
+func testGetConfigurationWithFileContentEnv(t *testing.T, fileName string, wantError bool, wantConfig *Config) {
 	t.Helper()
 	b, err := bootstrapFileReadFunc(fileName)
 	if err != nil {
@@ -327,9 +458,9 @@ func testNewConfigWithFileContentEnv(t *testing.T, fileName string, wantError bo
 	envconfig.XDSBootstrapFileContent = string(b)
 	defer func() { envconfig.XDSBootstrapFileContent = origBootstrapContent }()
 
-	c, err := NewConfig()
+	c, err := GetConfiguration()
 	if (err != nil) != wantError {
-		t.Fatalf("NewConfig() returned error %v, wantError: %v", err, wantError)
+		t.Fatalf("GetConfiguration() returned error %v, wantError: %v", err, wantError)
 	}
 	if wantError {
 		return
@@ -339,8 +470,9 @@ func testNewConfigWithFileContentEnv(t *testing.T, fileName string, wantError bo
 	}
 }
 
-// Tests NewConfig with bootstrap file contents that are expected to fail.
-func (s) TestNewConfig_Failure(t *testing.T) {
+// Tests GetConfiguration with bootstrap file contents that are expected to
+// fail.
+func (s) TestGetConfiguration_Failure(t *testing.T) {
 	bootstrapFileMap := map[string]string{
 		"empty":          "",
 		"badJSON":        `["test": 123]`,
@@ -385,18 +517,25 @@ func (s) TestNewConfig_Failure(t *testing.T) {
 	cancel := setupBootstrapOverride(bootstrapFileMap)
 	defer cancel()
 
-	for _, name := range []string{"nonExistentBootstrapFile", "empty", "badJSON", "noBalancerName", "emptyXdsServer"} {
+	for _, name := range []string{"nonExistentBootstrapFile", "badJSON", "noBalancerName", "emptyXdsServer"} {
 		t.Run(name, func(t *testing.T) {
-			testNewConfigWithFileNameEnv(t, name, true, nil)
-			testNewConfigWithFileContentEnv(t, name, true, nil)
+			testGetConfigurationWithFileNameEnv(t, name, true, nil)
+			testGetConfigurationWithFileContentEnv(t, name, true, nil)
 		})
 	}
+	const name = "empty"
+	t.Run(name, func(t *testing.T) {
+		testGetConfigurationWithFileNameEnv(t, name, true, nil)
+		// If both the env vars are empty, a nil config with a nil error must be
+		// returned.
+		testGetConfigurationWithFileContentEnv(t, name, false, nil)
+	})
 }
 
-// TestNewConfigV3ProtoSuccess exercises the functionality in NewConfig with
-// different bootstrap file contents. It overrides the fileReadFunc by returning
-// bootstrap file contents defined in this test, instead of reading from a file.
-func (s) TestNewConfig_Success(t *testing.T) {
+// Tests the functionality in GetConfiguration with different bootstrap file
+// contents. It overrides the fileReadFunc by returning bootstrap file contents
+// defined in this test, instead of reading from a file.
+func (s) TestGetConfiguration_Success(t *testing.T) {
 	cancel := setupBootstrapOverride(v3BootstrapFileMap)
 	defer cancel()
 
@@ -408,9 +547,9 @@ func (s) TestNewConfig_Success(t *testing.T) {
 			name: "emptyNodeProto",
 			wantConfig: &Config{
 				xDSServers: []*ServerConfig{{
-					serverURI:     "trafficdirector.googleapis.com:443",
-					channelCreds:  []ChannelCreds{{Type: "insecure"}},
-					selectedCreds: ChannelCreds{Type: "insecure"},
+					serverURI:            "trafficdirector.googleapis.com:443",
+					channelCreds:         []ChannelCredsConfig{{Type: "insecure"}},
+					selectedChannelCreds: ChannelCredsConfig{Type: "insecure"},
 				}},
 				node: node{
 					userAgentName:        gRPCUserAgentName,
@@ -427,23 +566,85 @@ func (s) TestNewConfig_Success(t *testing.T) {
 		{"goodBootstrap", configWithGoogleDefaultCredsAndV3},
 		{"multipleXDSServers", configWithMultipleServers},
 		{"serverSupportsIgnoreResourceDeletion", configWithGoogleDefaultCredsAndIgnoreResourceDeletion},
+		{"serverSupportsTrustedXDSServer", configWithGoogleDefaultCredsAndTrustedXDSServer},
+		{"istioStyleInsecureWithoutCallCreds", configWithIstioStyleNoCallCreds},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			testNewConfigWithFileNameEnv(t, test.name, false, test.wantConfig)
-			testNewConfigWithFileContentEnv(t, test.name, false, test.wantConfig)
+			testGetConfigurationWithFileNameEnv(t, test.name, false, test.wantConfig)
+			testGetConfigurationWithFileContentEnv(t, test.name, false, test.wantConfig)
 		})
 	}
 }
 
-// TestNewConfigBootstrapEnvPriority tests that the two env variables are read
-// in correct priority.
+// Tests Istio-style bootstrap configurations with JWT call credentials.
+func (s) TestGetConfiguration_IstioStyleWithCallCreds(t *testing.T) {
+	testutils.SetEnvConfig(t, &envconfig.XDSBootstrapCallCredsEnabled, true)
+	cancel := setupBootstrapOverride(v3BootstrapFileMap)
+	defer cancel()
+
+	configWithIstioJWTCallCreds := &Config{
+		xDSServers: []*ServerConfig{{
+			serverURI:            "unix:///etc/istio/XDS",
+			channelCreds:         []ChannelCredsConfig{{Type: "insecure"}},
+			callCredsConfigs:     []CallCredsConfig{{Type: "jwt_token_file", Config: json.RawMessage("{\n\"jwt_token_file\": \"/var/run/secrets/tokens/istio-token\"\n}")}},
+			serverFeatures:       []string{"xds_v3"},
+			selectedChannelCreds: ChannelCredsConfig{Type: "insecure"},
+			selectedCallCreds:    selectedJWTCallCreds,
+		}},
+		node: node{
+			ID:                   "sidecar~127.0.0.1~pod1.fake-namespace~fake-namespace.svc.cluster.local",
+			Metadata:             istioNodeMetadata,
+			userAgentName:        gRPCUserAgentName,
+			userAgentVersionType: userAgentVersion{UserAgentVersion: grpc.Version},
+			clientFeatures:       []string{clientFeatureNoOverprovisioning, clientFeatureResourceWrapper},
+		},
+		certProviderConfigs:                       map[string]*certprovider.BuildableConfig{},
+		clientDefaultListenerResourceNameTemplate: "%s",
+	}
+	configWithIstioStyleWithTLSAndJWT := &Config{
+		xDSServers: []*ServerConfig{{
+			serverURI:            "unix:///etc/istio/XDS",
+			channelCreds:         []ChannelCredsConfig{{Type: "tls", Config: json.RawMessage("{}")}},
+			callCredsConfigs:     []CallCredsConfig{{Type: "jwt_token_file", Config: json.RawMessage("{\n\"jwt_token_file\": \"/var/run/secrets/tokens/istio-token\"\n}")}},
+			serverFeatures:       []string{"xds_v3"},
+			selectedChannelCreds: ChannelCredsConfig{Type: "tls", Config: json.RawMessage("{}")},
+			selectedCallCreds:    selectedJWTCallCreds,
+		}},
+		node: node{
+			ID:                   "sidecar~127.0.0.1~pod1.fake-namespace~fake-namespace.svc.cluster.local",
+			Metadata:             istioNodeMetadata,
+			userAgentName:        gRPCUserAgentName,
+			userAgentVersionType: userAgentVersion{UserAgentVersion: grpc.Version},
+			clientFeatures:       []string{clientFeatureNoOverprovisioning, clientFeatureResourceWrapper},
+		},
+		certProviderConfigs:                       map[string]*certprovider.BuildableConfig{},
+		clientDefaultListenerResourceNameTemplate: "%s",
+	}
+
+	tests := []struct {
+		name       string
+		wantConfig *Config
+	}{
+		{"istioStyleInsecureWithJWTCallCreds", configWithIstioJWTCallCreds},
+		{"istioStyleWithTLSAndJWT", configWithIstioStyleWithTLSAndJWT},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			testGetConfigurationWithFileNameEnv(t, test.name, false, test.wantConfig)
+			testGetConfigurationWithFileContentEnv(t, test.name, false, test.wantConfig)
+		})
+	}
+}
+
+// Tests that the two bootstrap env variables are read in correct priority.
 //
 // "GRPC_XDS_BOOTSTRAP" which specifies the file name containing the bootstrap
 // configuration takes precedence over "GRPC_XDS_BOOTSTRAP_CONFIG", which
 // directly specifies the bootstrap configuration in itself.
-func (s) TestNewConfigBootstrapEnvPriority(t *testing.T) {
+func (s) TestGetConfiguration_BootstrapEnvPriority(t *testing.T) {
 	oldFileReadFunc := bootstrapFileReadFunc
 	bootstrapFileReadFunc = func(filename string) ([]byte, error) {
 		return fileReadFromFileMap(v3BootstrapFileMap, filename)
@@ -465,17 +666,17 @@ func (s) TestNewConfigBootstrapEnvPriority(t *testing.T) {
 	envconfig.XDSBootstrapFileContent = ""
 	defer func() { envconfig.XDSBootstrapFileContent = origBootstrapContent }()
 
-	// When both env variables are empty, NewConfig should fail.
-	if _, err := NewConfig(); err == nil {
-		t.Errorf("NewConfig() returned nil error, expected to fail")
+	// When both env variables are empty, GetConfiguration should return nil.
+	if cfg, err := GetConfiguration(); err != nil || cfg != nil {
+		t.Errorf("GetConfiguration() returned (%v, %v), want (<nil>, <nil>)", cfg, err)
 	}
 
 	// When one of them is set, it should be used.
 	envconfig.XDSBootstrapFileName = goodFileName1
 	envconfig.XDSBootstrapFileContent = ""
-	c, err := NewConfig()
+	c, err := GetConfiguration()
 	if err != nil {
-		t.Errorf("NewConfig() failed: %v", err)
+		t.Errorf("GetConfiguration() failed: %v", err)
 	}
 	if diff := cmp.Diff(goodConfig1, c); diff != "" {
 		t.Errorf("Unexpected diff in bootstrap configuration (-want, +got):\n%s", diff)
@@ -483,9 +684,9 @@ func (s) TestNewConfigBootstrapEnvPriority(t *testing.T) {
 
 	envconfig.XDSBootstrapFileName = ""
 	envconfig.XDSBootstrapFileContent = goodFileContent2
-	c, err = NewConfig()
+	c, err = GetConfiguration()
 	if err != nil {
-		t.Errorf("NewConfig() failed: %v", err)
+		t.Errorf("GetConfiguration() failed: %v", err)
 	}
 	if diff := cmp.Diff(goodConfig2, c); diff != "" {
 		t.Errorf("Unexpected diff in bootstrap configuration (-want, +got):\n%s", diff)
@@ -494,9 +695,9 @@ func (s) TestNewConfigBootstrapEnvPriority(t *testing.T) {
 	// Set both, file name should be read.
 	envconfig.XDSBootstrapFileName = goodFileName1
 	envconfig.XDSBootstrapFileContent = goodFileContent2
-	c, err = NewConfig()
+	c, err = GetConfiguration()
 	if err != nil {
-		t.Errorf("NewConfig() failed: %v", err)
+		t.Errorf("GetConfiguration() failed: %v", err)
 	}
 	if diff := cmp.Diff(goodConfig1, c); diff != "" {
 		t.Errorf("Unexpected diff in bootstrap configuration (-want, +got):\n%s", diff)
@@ -554,7 +755,7 @@ type fakeCertProvider struct {
 	certprovider.Provider
 }
 
-func (s) TestNewConfigWithCertificateProviders(t *testing.T) {
+func (s) TestGetConfiguration_CertificateProviders(t *testing.T) {
 	bootstrapFileMap := map[string]string{
 		"badJSONCertProviderConfig": `
 		{
@@ -668,10 +869,10 @@ func (s) TestNewConfigWithCertificateProviders(t *testing.T) {
 
 	goodConfig := &Config{
 		xDSServers: []*ServerConfig{{
-			serverURI:      "trafficdirector.googleapis.com:443",
-			channelCreds:   []ChannelCreds{{Type: "insecure"}},
-			serverFeatures: []string{"xds_v3"},
-			selectedCreds:  ChannelCreds{Type: "insecure"},
+			serverURI:            "trafficdirector.googleapis.com:443",
+			channelCreds:         []ChannelCredsConfig{{Type: "insecure"}},
+			serverFeatures:       []string{"xds_v3"},
+			selectedChannelCreds: ChannelCredsConfig{Type: "insecure"},
 		}},
 		certProviderConfigs: map[string]*certprovider.BuildableConfig{
 			"fakeProviderInstance": wantCfg,
@@ -706,13 +907,13 @@ func (s) TestNewConfigWithCertificateProviders(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			testNewConfigWithFileNameEnv(t, test.name, test.wantErr, test.wantConfig)
-			testNewConfigWithFileContentEnv(t, test.name, test.wantErr, test.wantConfig)
+			testGetConfigurationWithFileNameEnv(t, test.name, test.wantErr, test.wantConfig)
+			testGetConfigurationWithFileContentEnv(t, test.name, test.wantErr, test.wantConfig)
 		})
 	}
 }
 
-func (s) TestNewConfigWithServerListenerResourceNameTemplate(t *testing.T) {
+func (s) TestGetConfiguration_ServerListenerResourceNameTemplate(t *testing.T) {
 	cancel := setupBootstrapOverride(map[string]string{
 		"badServerListenerResourceNameTemplate:": `
 		{
@@ -762,9 +963,9 @@ func (s) TestNewConfigWithServerListenerResourceNameTemplate(t *testing.T) {
 			name: "goodServerListenerResourceNameTemplate",
 			wantConfig: &Config{
 				xDSServers: []*ServerConfig{{
-					serverURI:     "trafficdirector.googleapis.com:443",
-					channelCreds:  []ChannelCreds{{Type: "google_default"}},
-					selectedCreds: ChannelCreds{Type: "google_default"},
+					serverURI:            "trafficdirector.googleapis.com:443",
+					channelCreds:         []ChannelCredsConfig{{Type: "google_default"}},
+					selectedChannelCreds: ChannelCredsConfig{Type: "google_default"},
 				}},
 				node:                               v3Node,
 				serverListenerResourceNameTemplate: "grpc/server?xds.resource.listening_address=%s",
@@ -775,13 +976,14 @@ func (s) TestNewConfigWithServerListenerResourceNameTemplate(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			testNewConfigWithFileNameEnv(t, test.name, test.wantErr, test.wantConfig)
-			testNewConfigWithFileContentEnv(t, test.name, test.wantErr, test.wantConfig)
+			testGetConfigurationWithFileNameEnv(t, test.name, test.wantErr, test.wantConfig)
+			testGetConfigurationWithFileContentEnv(t, test.name, test.wantErr, test.wantConfig)
 		})
 	}
 }
 
-func (s) TestNewConfigWithFederation(t *testing.T) {
+func (s) TestGetConfiguration_Federation(t *testing.T) {
+	testutils.SetEnvConfig(t, &envconfig.XDSClientExtProcEnabled, true)
 	cancel := setupBootstrapOverride(map[string]string{
 		"badclientListenerResourceNameTemplate": `
 		{
@@ -831,6 +1033,16 @@ func (s) TestNewConfigWithFederation(t *testing.T) {
 						"channel_creds": [ { "type": "google_default" } ],
 						"server_features" : ["xds_v3"]
 					}]
+				}
+			},
+			"allowed_grpc_services": {
+				"dns:///whitelisted-ext-proc:443": {
+					"channel_creds": [
+						{ "type": "insecure" }
+					],
+					"call_creds": [
+						{ "type": "jwt_token_file", "config": {"jwt_token_file":"/var/run/secrets/tokens/istio-token"} }
+					]
 				}
 			}
 		}`,
@@ -911,9 +1123,9 @@ func (s) TestNewConfigWithFederation(t *testing.T) {
 			name: "good",
 			wantConfig: &Config{
 				xDSServers: []*ServerConfig{{
-					serverURI:     "trafficdirector.googleapis.com:443",
-					channelCreds:  []ChannelCreds{{Type: "google_default"}},
-					selectedCreds: ChannelCreds{Type: "google_default"},
+					serverURI:            "trafficdirector.googleapis.com:443",
+					channelCreds:         []ChannelCredsConfig{{Type: "google_default"}},
+					selectedChannelCreds: ChannelCredsConfig{Type: "google_default"},
 				}},
 				node:                               v3Node,
 				serverListenerResourceNameTemplate: "xdstp://xds.example.com/envoy.config.listener.v3.Listener/grpc/server?listening_address=%s",
@@ -922,11 +1134,28 @@ func (s) TestNewConfigWithFederation(t *testing.T) {
 					"xds.td.com": {
 						ClientListenerResourceNameTemplate: "xdstp://xds.td.com/envoy.config.listener.v3.Listener/%s",
 						XDSServers: []*ServerConfig{{
-							serverURI:      "td.com",
-							channelCreds:   []ChannelCreds{{Type: "google_default"}},
-							serverFeatures: []string{"xds_v3"},
-							selectedCreds:  ChannelCreds{Type: "google_default"},
+							serverURI:            "td.com",
+							channelCreds:         []ChannelCredsConfig{{Type: "google_default"}},
+							serverFeatures:       []string{"xds_v3"},
+							selectedChannelCreds: ChannelCredsConfig{Type: "google_default"},
 						}},
+					},
+				},
+				allowedGRPCServices: map[string]*AllowedGRPCService{
+					"dns:///whitelisted-ext-proc:443": {
+						targetURI:    "dns:///whitelisted-ext-proc:443",
+						channelCreds: []ChannelCredsConfig{{Type: "insecure"}},
+						callCredsConfigs: []CallCredsConfig{{
+							Type:   "jwt_token_file",
+							Config: json.RawMessage("{\n\"jwt_token_file\": \"/var/run/secrets/tokens/istio-token\"\n}"),
+						}},
+						// Equal compares the built credentials by identity, so
+						// the fixture carries identity-only pairs.
+						sideChannelCreds: xdscreds.NewChannelCreds(nil, xdscreds.Identity{Type: "insecure"}, nil),
+						sideCallCreds: []*xdscreds.CallCreds{xdscreds.NewCallCreds(nil, xdscreds.Identity{
+							Type: "jwt_token_file",
+							Data: json.RawMessage("{\n\"jwt_token_file\": \"/var/run/secrets/tokens/istio-token\"\n}"),
+						}, nil)},
 					},
 				},
 			},
@@ -935,9 +1164,9 @@ func (s) TestNewConfigWithFederation(t *testing.T) {
 			name: "goodWithDefaultDefaultClientListenerTemplate",
 			wantConfig: &Config{
 				xDSServers: []*ServerConfig{{
-					serverURI:     "trafficdirector.googleapis.com:443",
-					channelCreds:  []ChannelCreds{{Type: "google_default"}},
-					selectedCreds: ChannelCreds{Type: "google_default"},
+					serverURI:            "trafficdirector.googleapis.com:443",
+					channelCreds:         []ChannelCredsConfig{{Type: "google_default"}},
+					selectedChannelCreds: ChannelCredsConfig{Type: "google_default"},
 				}},
 				node: v3Node,
 				clientDefaultListenerResourceNameTemplate: "%s",
@@ -947,9 +1176,9 @@ func (s) TestNewConfigWithFederation(t *testing.T) {
 			name: "goodWithDefaultClientListenerTemplatePerAuthority",
 			wantConfig: &Config{
 				xDSServers: []*ServerConfig{{
-					serverURI:     "trafficdirector.googleapis.com:443",
-					channelCreds:  []ChannelCreds{{Type: "google_default"}},
-					selectedCreds: ChannelCreds{Type: "google_default"},
+					serverURI:            "trafficdirector.googleapis.com:443",
+					channelCreds:         []ChannelCredsConfig{{Type: "google_default"}},
+					selectedChannelCreds: ChannelCredsConfig{Type: "google_default"},
 				}},
 				node: v3Node,
 				clientDefaultListenerResourceNameTemplate: "xdstp://xds.example.com/envoy.config.listener.v3.Listener/%s",
@@ -967,9 +1196,9 @@ func (s) TestNewConfigWithFederation(t *testing.T) {
 			name: "goodWithNoServerPerAuthority",
 			wantConfig: &Config{
 				xDSServers: []*ServerConfig{{
-					serverURI:     "trafficdirector.googleapis.com:443",
-					channelCreds:  []ChannelCreds{{Type: "google_default"}},
-					selectedCreds: ChannelCreds{Type: "google_default"},
+					serverURI:            "trafficdirector.googleapis.com:443",
+					channelCreds:         []ChannelCredsConfig{{Type: "google_default"}},
+					selectedChannelCreds: ChannelCredsConfig{Type: "google_default"},
 				}},
 				node: v3Node,
 				clientDefaultListenerResourceNameTemplate: "xdstp://xds.example.com/envoy.config.listener.v3.Listener/%s",
@@ -984,8 +1213,8 @@ func (s) TestNewConfigWithFederation(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			testNewConfigWithFileNameEnv(t, test.name, test.wantErr, test.wantConfig)
-			testNewConfigWithFileContentEnv(t, test.name, test.wantErr, test.wantConfig)
+			testGetConfigurationWithFileNameEnv(t, test.name, test.wantErr, test.wantConfig)
+			testGetConfigurationWithFileContentEnv(t, test.name, test.wantErr, test.wantConfig)
 		})
 	}
 }
@@ -1014,7 +1243,7 @@ func (s) TestDefaultBundles(t *testing.T) {
 
 	for _, typename := range tests {
 		t.Run(typename, func(t *testing.T) {
-			if c := bootstrap.GetCredentials(typename); c == nil {
+			if c := bootstrap.GetChannelCredentials(typename); c == nil {
 				t.Errorf(`bootstrap.GetCredentials(%s) credential is nil, want non-nil`, typename)
 			}
 		})
@@ -1027,6 +1256,185 @@ type s struct {
 
 func Test(t *testing.T) {
 	grpctest.RunSubTests(t, s{})
+}
+
+func (s) TestCallCreds_Equal(t *testing.T) {
+	tests := []struct {
+		name string
+		cc1  CallCredsConfig
+		cc2  CallCredsConfig
+		want bool
+	}{
+		{
+			name: "identical_configs",
+			cc1:  CallCredsConfig{Type: "jwt_token_file", Config: json.RawMessage(`{"jwt_token_file": "/path/to/token"}`)},
+			cc2:  CallCredsConfig{Type: "jwt_token_file", Config: json.RawMessage(`{"jwt_token_file": "/path/to/token"}`)},
+			want: true,
+		},
+		{
+			name: "different_types",
+			cc1:  CallCredsConfig{Type: "jwt_token_file", Config: json.RawMessage(`{"jwt_token_file": "/path/to/token"}`)},
+			cc2:  CallCredsConfig{Type: "other_type", Config: json.RawMessage(`{"jwt_token_file": "/path/to/token"}`)},
+			want: false,
+		},
+		{
+			name: "different_configs",
+			cc1:  CallCredsConfig{Type: "jwt_token_file", Config: json.RawMessage(`{"jwt_token_file": "/path/to/token"}`)},
+			cc2:  CallCredsConfig{Type: "jwt_token_file", Config: json.RawMessage(`{"jwt_token_file": "/different/path"}`)},
+			want: false,
+		},
+		{
+			name: "nil_vs_non-nil_configs",
+			cc1:  CallCredsConfig{Type: "jwt_token_file", Config: nil},
+			cc2:  CallCredsConfig{Type: "jwt_token_file", Config: json.RawMessage(`{"jwt_token_file": "/path/to/token"}`)},
+			want: false,
+		},
+		{
+			name: "both_nil_configs",
+			cc1:  CallCredsConfig{Type: "jwt_token_file", Config: nil},
+			cc2:  CallCredsConfig{Type: "jwt_token_file", Config: nil},
+			want: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := test.cc1.Equal(test.cc2); got != test.want {
+				t.Errorf("CallCreds.Equal() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func (s) TestServerConfig_UnmarshalJSON_WithCallCreds(t *testing.T) {
+	testutils.SetEnvConfig(t, &envconfig.XDSBootstrapCallCredsEnabled, true)
+	tests := []struct {
+		name          string
+		json          string
+		wantCallCreds CallCredsConfigs
+	}{
+		{
+			name: "valid_call_creds_with_jwt_token_file",
+			json: `{
+				"server_uri": "xds-server:443",
+				"channel_creds": [{"type": "insecure"}],
+				"call_creds": [
+					{
+						"type": "jwt_token_file",
+						"config": {"jwt_token_file": "/path/to/token.jwt"}
+					}
+				]
+			}`,
+			wantCallCreds: []CallCredsConfig{{
+				Type:   "jwt_token_file",
+				Config: json.RawMessage(`{"jwt_token_file": "/path/to/token.jwt"}`),
+			}},
+		},
+		{
+			name: "multiple_call_creds_types",
+			json: `{
+				"server_uri": "xds-server:443",
+				"channel_creds": [{"type": "insecure"}],
+				"call_creds": [
+					{"type": "jwt_token_file", "config": {"jwt_token_file": "/token1.jwt"}},
+					{"type": "unsupported_type", "config": {}}
+				]
+			}`,
+			wantCallCreds: []CallCredsConfig{
+				{Type: "jwt_token_file", Config: json.RawMessage(`{"jwt_token_file": "/token1.jwt"}`)},
+				{Type: "unsupported_type", Config: json.RawMessage(`{}`)},
+			},
+		},
+		{
+			name: "empty_call_creds_array",
+			json: `{
+				"server_uri": "xds-server:443",
+				"channel_creds": [{"type": "insecure"}],
+				"call_creds": []
+			}`,
+			wantCallCreds: []CallCredsConfig{},
+		},
+		{
+			name: "unspecified_call_creds_field",
+			json: `{
+				"server_uri": "xds-server:443",
+				"channel_creds": [{"type": "insecure"}]
+			}`,
+			wantCallCreds: nil,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var sc ServerConfig
+			err := sc.UnmarshalJSON([]byte(test.json))
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			if diff := cmp.Diff(test.wantCallCreds, sc.CallCredsConfigs()); diff != "" {
+				t.Errorf("CallCreds mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func (s) TestServerConfig_Equal_WithCallCreds(t *testing.T) {
+	callCreds := []CallCredsConfig{{
+		Type:   "jwt_token_file",
+		Config: json.RawMessage(`{"jwt_token_file": "/test/token.jwt"}`),
+	}}
+	sc1 := &ServerConfig{
+		serverURI:        "server1",
+		channelCreds:     []ChannelCredsConfig{{Type: "insecure"}},
+		callCredsConfigs: callCreds,
+		serverFeatures:   []string{"feature1"},
+	}
+	sc2 := &ServerConfig{
+		serverURI:        "server1",
+		channelCreds:     []ChannelCredsConfig{{Type: "insecure"}},
+		callCredsConfigs: callCreds,
+		serverFeatures:   []string{"feature1"},
+	}
+	sc3 := &ServerConfig{
+		serverURI:        "server1",
+		channelCreds:     []ChannelCredsConfig{{Type: "insecure"}},
+		callCredsConfigs: []CallCredsConfig{{Type: "different"}},
+		serverFeatures:   []string{"feature1"},
+	}
+
+	if !sc1.Equal(sc2) {
+		t.Error("Equal ServerConfigs with same call creds should be equal")
+	}
+	if sc1.Equal(sc3) {
+		t.Error("ServerConfigs with different call creds should not be equal")
+	}
+}
+
+func (s) TestServerConfig_MarshalJSON_WithCallCreds(t *testing.T) {
+	testutils.SetEnvConfig(t, &envconfig.XDSBootstrapCallCredsEnabled, true)
+	sc := &ServerConfig{
+		serverURI:    "test-server:443",
+		channelCreds: []ChannelCredsConfig{{Type: "insecure"}},
+		callCredsConfigs: []CallCredsConfig{{
+			Type:   "jwt_token_file",
+			Config: json.RawMessage(`{"jwt_token_file":"/test/token.jwt"}`),
+		}},
+		serverFeatures: []string{"test_feature"},
+	}
+
+	data, err := sc.MarshalJSON()
+	if err != nil {
+		t.Fatalf("MarshalJSON failed: %v", err)
+	}
+
+	// Check Marshal/Unmarshal symmetry.
+	var unmarshaled ServerConfig
+	if err := json.Unmarshal(data, &unmarshaled); err != nil {
+		t.Fatalf("Unmarshal failed: %v", err)
+	}
+	if diff := cmp.Diff(sc.CallCredsConfigs(), unmarshaled.CallCredsConfigs()); diff != "" {
+		t.Errorf("Marshal/Unmarshal call credentials produces differences:\n%s", diff)
+	}
 }
 
 func newStructProtoFromMap(t *testing.T, input map[string]any) *structpb.Struct {
@@ -1193,6 +1601,387 @@ func (s) TestNode_ToProto(t *testing.T) {
 			gotProto := test.inputNode.toProto()
 			if diff := cmp.Diff(test.wantProto, gotProto, protocmp.Transform()); diff != "" {
 				t.Fatalf("Unexpected diff in node proto: (-want, +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func (s) TestBootstrap_SelectedChannelCredsAndCallCreds(t *testing.T) {
+	testutils.SetEnvConfig(t, &envconfig.XDSBootstrapCallCredsEnabled, true)
+	tests := []struct {
+		name              string
+		bootstrapConfig   string
+		wantDialOpts      int
+		wantTransportType string
+	}{
+		{
+			name: "JWT_call_creds_with_TLS_channel_creds",
+			bootstrapConfig: `{
+				"server_uri": "xds-server:443",
+				"channel_creds": [{"type": "tls", "config": {}}],
+				"call_creds": [
+					{
+						"type": "jwt_token_file",
+						"config": {"jwt_token_file": "/token.jwt"}
+					}
+				]
+			}`,
+			wantDialOpts:      1,
+			wantTransportType: "tls",
+		},
+		{
+			name: "JWT_call_creds_with_multiple_channel_creds",
+			bootstrapConfig: `{
+				"server_uri": "xds-server:443",
+				"channel_creds": [{"type": "tls", "config": {}}, {"type": "insecure"}],
+				"call_creds": [
+					{
+						"type": "jwt_token_file",
+						"config": {"jwt_token_file": "/token.jwt"}
+					},
+					{
+						"type": "jwt_token_file",
+						"config": {"jwt_token_file": "/token2.jwt"}
+					}
+				]
+			}`,
+			wantDialOpts:      2,
+			wantTransportType: "tls", // The first channel creds is selected.
+		},
+		{
+			name: "JWT_call_creds_with_insecure_channel_creds",
+			bootstrapConfig: `{
+				"server_uri": "xds-server:443",
+				"channel_creds": [{"type": "insecure"}],
+				"call_creds": [
+					{
+						"type": "jwt_token_file",
+						"config": {"jwt_token_file": "/token.jwt"}
+					}
+				]
+			}`,
+			wantDialOpts:      1,
+			wantTransportType: "insecure",
+		},
+		{
+			name: "No_call_creds",
+			bootstrapConfig: `{
+				"server_uri": "xds-server:443",
+				"channel_creds": [{"type": "insecure"}]
+			}`,
+			wantDialOpts:      0,
+			wantTransportType: "insecure",
+		},
+		{
+			name: "No_call_creds_multiple_channel_creds",
+			bootstrapConfig: `{
+				"server_uri": "xds-server:443",
+				"channel_creds": [{"type": "insecure"}, {"type": "tls", "config": {}}]
+			}`,
+			wantDialOpts:      0,
+			wantTransportType: "insecure",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var sc ServerConfig
+			err := sc.UnmarshalJSON([]byte(test.bootstrapConfig))
+			if err != nil {
+				t.Fatalf("Failed to unmarshal bootstrap config: %v", err)
+			}
+
+			// Verify call credentials processing.
+			callCredsConfig := sc.CallCredsConfigs()
+			dialOpts := sc.DialOptions()
+			if len(callCredsConfig) != test.wantDialOpts {
+				t.Errorf("Call creds configs count = %d, want %d", len(callCredsConfig), test.wantDialOpts)
+			}
+			if len(dialOpts) != test.wantDialOpts {
+				t.Errorf("Call creds count = %d, want %d", len(dialOpts), test.wantDialOpts)
+			}
+			// Verify transport credentials are properly selected.
+			if sc.SelectedChannelCreds().Type != test.wantTransportType {
+				t.Errorf("Selected transport creds type = %q, want %q", sc.SelectedChannelCreds().Type, test.wantTransportType)
+			}
+		})
+	}
+}
+
+func (s) TestBootstrap_SelectedCallCreds_WhenNotCCNotEnabled(t *testing.T) {
+	testutils.SetEnvConfig(t, &envconfig.XDSBootstrapCallCredsEnabled, false)
+	config := `{
+					"server_uri": "xds-server:443",
+					"channel_creds": [{"type": "tls", "config": {}}],
+					"call_creds": [
+						{
+							"type": "jwt_token_file",
+							"config": {"jwt_token_file": "/token.jwt"}
+						}
+					]
+				}`
+
+	var sc ServerConfig
+	err := sc.UnmarshalJSON([]byte(config))
+	if err != nil {
+		t.Fatalf("Failed to unmarshal bootstrap config: %v", err)
+	}
+
+	// Verify call credentials processing.
+	callCredsConfig := sc.CallCredsConfigs()
+	dialOpts := sc.DialOptions()
+	if len(callCredsConfig) != 1 {
+		t.Errorf("Call creds configs count = %d, want %d", len(callCredsConfig), 1)
+	}
+	// Even though we have parsed the call creds configs, we are not using them
+	// because the env variable is not enabled.
+	if len(dialOpts) != 0 {
+		t.Errorf("Call creds count = %d, want %d", len(dialOpts), 0)
+	}
+}
+
+// TestAllowedGRPCServices_UnmarshalJSON verifies parsing of the
+// allowed_grpc_services field, operating directly on the AllowedGRPCServices
+// type.
+func (s) TestAllowedGRPCServices_UnmarshalJSON(t *testing.T) {
+	testutils.SetEnvConfig(t, &envconfig.XDSClientExtProcEnabled, true)
+	const target = "dns:///sharding-service:443"
+	tests := []struct {
+		name string
+		json string
+		// want carries the expected target and credential identities;
+		// comparisons use the Equal methods via cmp.Diff.
+		want AllowedGRPCServices
+		// wantCallCreds is the number of call credentials expected to be
+		// built for the target.
+		wantCallCreds int
+	}{
+		{
+			name: "insecure_channel_creds",
+			json: `{"dns:///sharding-service:443": {"channel_creds": [{"type": "insecure"}]}}`,
+			want: AllowedGRPCServices{target: {
+				targetURI:        target,
+				sideChannelCreds: xdscreds.NewChannelCreds(nil, xdscreds.Identity{Type: "insecure"}, nil),
+			}},
+		},
+		{
+			name: "with_call_creds",
+			json: `{"dns:///sharding-service:443": {"channel_creds": [{"type": "insecure"}], "call_creds": [{"type": "jwt_token_file", "config": {"jwt_token_file": "/var/run/secrets/tokens/istio-token"}}]}}`,
+			want: AllowedGRPCServices{target: {
+				targetURI:        target,
+				sideChannelCreds: xdscreds.NewChannelCreds(nil, xdscreds.Identity{Type: "insecure"}, nil),
+				sideCallCreds: []*xdscreds.CallCreds{xdscreds.NewCallCreds(nil, xdscreds.Identity{
+					Type: "jwt_token_file",
+					Data: json.RawMessage(`{"jwt_token_file": "/var/run/secrets/tokens/istio-token"}`),
+				}, nil)},
+			}},
+			wantCallCreds: 1,
+		},
+		{
+			// Unsupported call-creds types are skipped without error, so no
+			// call credentials are built.
+			name: "unsupported_call_creds_skipped",
+			json: `{"dns:///sharding-service:443": {"channel_creds": [{"type": "insecure"}], "call_creds": [{"type": "unsupported_call_creds_type"}]}}`,
+			want: AllowedGRPCServices{target: {
+				targetURI:        target,
+				sideChannelCreds: xdscreds.NewChannelCreds(nil, xdscreds.Identity{Type: "insecure"}, nil),
+			}},
+		},
+		{
+			// One call credential is built for each supported call-creds
+			// config, preserving order.
+			name: "multiple_supported_call_creds",
+			json: `{"dns:///sharding-service:443": {"channel_creds": [{"type": "insecure"}], "call_creds": [{"type": "jwt_token_file", "config": {"jwt_token_file": "/tokens/token-one"}}, {"type": "jwt_token_file", "config": {"jwt_token_file": "/tokens/token-two"}}]}}`,
+			want: AllowedGRPCServices{target: {
+				targetURI:        target,
+				sideChannelCreds: xdscreds.NewChannelCreds(nil, xdscreds.Identity{Type: "insecure"}, nil),
+				sideCallCreds: []*xdscreds.CallCreds{
+					xdscreds.NewCallCreds(nil, xdscreds.Identity{
+						Type: "jwt_token_file",
+						Data: json.RawMessage(`{"jwt_token_file": "/tokens/token-one"}`),
+					}, nil),
+					xdscreds.NewCallCreds(nil, xdscreds.Identity{
+						Type: "jwt_token_file",
+						Data: json.RawMessage(`{"jwt_token_file": "/tokens/token-two"}`),
+					}, nil),
+				},
+			}},
+			wantCallCreds: 2,
+		},
+		{
+			name: "tls_channel_creds",
+			json: `{"dns:///sharding-service:443": {"channel_creds": [{"type": "tls", "config": {}}]}}`,
+			want: AllowedGRPCServices{target: {
+				targetURI:        target,
+				sideChannelCreds: xdscreds.NewChannelCreds(nil, xdscreds.Identity{Type: "tls", Data: json.RawMessage("{}")}, nil),
+			}},
+		},
+		{
+			name: "skips_unsupported_channel_creds",
+			json: `{"dns:///sharding-service:443": {"channel_creds": [{"type": "unsupported_cred_type"}, {"type": "insecure"}]}}`,
+			want: AllowedGRPCServices{target: {
+				targetURI:        target,
+				sideChannelCreds: xdscreds.NewChannelCreds(nil, xdscreds.Identity{Type: "insecure"}, nil),
+			}},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var got AllowedGRPCServices
+			if err := json.Unmarshal([]byte(test.json), &got); err != nil {
+				t.Fatalf("AllowedGRPCServices unmarshal failed: %v", err)
+			}
+			if diff := cmp.Diff(test.want, got); diff != "" {
+				t.Errorf("AllowedGRPCServices unmarshal returned unexpected diff (-want +got):\n%s", diff)
+			}
+			// Equal compares credentials by identity only, so it cannot tell
+			// a built credential from a nil one; verify the credentials were
+			// built.
+			chanCreds, callCreds := got[target].SideChannelCredentials()
+			if chanCreds == nil || chanCreds.Bundle() == nil {
+				t.Error("SideChannelCredentials() returned no built channel credentials")
+			}
+			if len(callCreds) != test.wantCallCreds {
+				t.Errorf("SideChannelCredentials() returned %d call credentials, want %d", len(callCreds), test.wantCallCreds)
+			}
+			for i, cc := range callCreds {
+				if cc.Credentials() == nil {
+					t.Errorf("SideChannelCredentials() call credentials[%d] have no built credentials", i)
+				}
+			}
+		})
+	}
+}
+
+// TestAllowedGRPCServices_UnmarshalJSON_Errors verifies that invalid
+// allowed_grpc_services entries are rejected while parsing the field.
+func (s) TestAllowedGRPCServices_UnmarshalJSON_Errors(t *testing.T) {
+	testutils.SetEnvConfig(t, &envconfig.XDSClientExtProcEnabled, true)
+	tests := []struct {
+		name string
+		json string
+	}{
+		{
+			name: "no_supported_channel_creds",
+			json: `{"dns:///sharding-service:443": {"channel_creds": [{"type": "unsupported_cred_type"}]}}`,
+		},
+		{
+			name: "null_entry",
+			json: `{"dns:///sharding-service:443": null}`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var got AllowedGRPCServices
+			if err := json.Unmarshal([]byte(test.json), &got); err == nil {
+				t.Fatalf("AllowedGRPCServices unmarshal succeeded, want error")
+			}
+		})
+	}
+}
+
+// TestBootstrap_AllowedGRPCServices_NullEntryRejected verifies that a null
+// allowed_grpc_services entry is rejected rather than silently accepted as a
+// credential-less allowlisted target. gRFC A102 requires channel_creds on
+// every entry, but a JSON null map value is decoded without invoking
+// UnmarshalJSON, so it would otherwise bypass that validation.
+func (s) TestBootstrap_AllowedGRPCServices_NullEntryRejected(t *testing.T) {
+	testutils.SetEnvConfig(t, &envconfig.XDSClientExtProcEnabled, true)
+	cfg := `{
+		"xds_servers": [{
+			"server_uri": "trafficdirector.googleapis.com:443",
+			"channel_creds": [{"type": "insecure"}]
+		}],
+		"allowed_grpc_services": {"dns:///side-channel:443": null}
+	}`
+	var c Config
+	if err := c.UnmarshalJSON([]byte(cfg)); err == nil {
+		t.Fatalf("Config.UnmarshalJSON() succeeded; want error for null allowed_grpc_services entry")
+	}
+}
+
+// TestAllowedGRPCService_Accessors exercises TargetURI and Equal, including
+// inequality when only the target URI differs.
+func (s) TestAllowedGRPCService_Accessors(t *testing.T) {
+	testutils.SetEnvConfig(t, &envconfig.XDSClientExtProcEnabled, true)
+	const target = "dns:///sharding-service:443"
+	cfg := `{"dns:///sharding-service:443": {"channel_creds": [{"type": "insecure"}]}}`
+	var s1, s2 AllowedGRPCServices
+	if err := json.Unmarshal([]byte(cfg), &s1); err != nil {
+		t.Fatalf("AllowedGRPCServices unmarshal failed: %v", err)
+	}
+	if err := json.Unmarshal([]byte(cfg), &s2); err != nil {
+		t.Fatalf("AllowedGRPCServices unmarshal failed: %v", err)
+	}
+	svc := s1[target]
+	if got := svc.TargetURI(); got != target {
+		t.Errorf("TargetURI() = %q, want %q", got, target)
+	}
+	// Two independent parses of the same config must compare equal.
+	if !svc.Equal(s2[target]) {
+		t.Errorf("Equal() = false for identical configs, want true")
+	}
+	// Two services identical except for target URI must not be equal.
+	diff := *svc
+	diff.targetURI = "dns:///different:443"
+	if svc.Equal(&diff) {
+		t.Errorf("Equal() = true for services with different target URIs, want false")
+	}
+}
+
+// TestAllowedGRPCServices_Disabled verifies that the allowed_grpc_services
+// field is ignored entirely when no consuming feature is enabled: nothing is
+// parsed, and even a malformed entry does not fail parsing.
+func (s) TestAllowedGRPCServices_Disabled(t *testing.T) {
+	testutils.SetEnvConfig(t, &envconfig.XDSClientExtProcEnabled, false)
+	testutils.SetEnvConfig(t, &envconfig.XDSAutoshardingEnabled, false)
+	cfg := `{"dns:///side-channel:443": {"channel_creds": [{"type": "unsupported_cred_type"}]}}`
+	var got AllowedGRPCServices
+	if err := json.Unmarshal([]byte(cfg), &got); err != nil {
+		t.Fatalf("AllowedGRPCServices unmarshal failed: %v", err)
+	}
+	if got != nil {
+		t.Errorf("AllowedGRPCServices = %v, want nil when disabled", got)
+	}
+}
+
+// TestAllowedGRPCServices_Enabled verifies that the allowed_grpc_services field
+// is parsed when any one of the features that consume it is enabled.
+func (s) TestAllowedGRPCServices_Enabled(t *testing.T) {
+	const target = "dns:///side-channel:443"
+	cfg := `{"dns:///side-channel:443": {"channel_creds": [{"type": "insecure"}]}}`
+	want := AllowedGRPCServices{target: {
+		targetURI:        target,
+		sideChannelCreds: xdscreds.NewChannelCreds(nil, xdscreds.Identity{Type: "insecure"}, nil),
+	}}
+
+	tests := []struct {
+		name                string
+		extProcEnabled      bool
+		autoshardingEnabled bool
+	}{
+		{
+			name:           "ext_proc",
+			extProcEnabled: true,
+		},
+		{
+			name:                "autosharding",
+			autoshardingEnabled: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			testutils.SetEnvConfig(t, &envconfig.XDSClientExtProcEnabled, test.extProcEnabled)
+			testutils.SetEnvConfig(t, &envconfig.XDSAutoshardingEnabled, test.autoshardingEnabled)
+			var got AllowedGRPCServices
+			if err := json.Unmarshal([]byte(cfg), &got); err != nil {
+				t.Fatalf("AllowedGRPCServices unmarshal failed: %v", err)
+			}
+			if diff := cmp.Diff(want, got); diff != "" {
+				t.Errorf("AllowedGRPCServices unmarshal returned unexpected diff (-want +got):\n%s", diff)
 			}
 		})
 	}

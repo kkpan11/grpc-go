@@ -24,7 +24,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -42,13 +41,14 @@ import (
 	"google.golang.org/grpc/internal/testutils"
 	"google.golang.org/grpc/internal/testutils/xds/e2e"
 	"google.golang.org/grpc/internal/xds/bootstrap"
-	"google.golang.org/grpc/xds/internal/xdsclient"
-	"google.golang.org/grpc/xds/internal/xdsclient/xdsresource/version"
+	internalserver "google.golang.org/grpc/internal/xds/server"
+	"google.golang.org/grpc/internal/xds/xdsclient"
+	"google.golang.org/grpc/internal/xds/xdsclient/xdsresource/version"
 
 	v3listenerpb "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	v3discoverypb "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 
-	_ "google.golang.org/grpc/xds/internal/httpfilter/router" // Register the router filter
+	_ "google.golang.org/grpc/internal/xds/httpfilter/router" // Register the router filter
 )
 
 const (
@@ -106,6 +106,51 @@ func generateBootstrapContents(t *testing.T, nodeID, serverURI string) []byte {
 	return bs
 }
 
+func (s) TestUnderlyingGRPCServer(t *testing.T) {
+	grpcServer, ok := internalserver.UnderlyingGRPCServer.(func(*GRPCServer) *grpc.Server)
+	if !ok {
+		t.Fatalf("UnderlyingGRPCServer has type %T, want func(*GRPCServer) *grpc.Server", internalserver.UnderlyingGRPCServer)
+	}
+
+	tests := []struct {
+		name   string
+		server func(*testing.T) (*GRPCServer, *grpc.Server)
+	}{
+		{
+			name: "underlying_server",
+			server: func(t *testing.T) (*GRPCServer, *grpc.Server) {
+				bootstrapContents := generateBootstrapContents(t, uuid.NewString(), nonExistentManagementServer)
+				xdsServer, err := NewGRPCServer(BootstrapContentsForTesting(bootstrapContents))
+				if err != nil {
+					t.Fatalf("NewGRPCServer() failed: %v", err)
+				}
+				t.Cleanup(xdsServer.Stop)
+				return xdsServer, xdsServer.gs.(*grpc.Server)
+			},
+		},
+		{
+			name: "nil_server",
+			server: func(*testing.T) (*GRPCServer, *grpc.Server) {
+				return nil, nil
+			},
+		},
+		{
+			name: "test_implementation",
+			server: func(*testing.T) (*GRPCServer, *grpc.Server) {
+				return &GRPCServer{gs: newFakeGRPCServer()}, nil
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server, want := test.server(t)
+			if got := grpcServer(server); got != want {
+				t.Errorf("UnderlyingGRPCServer(%p) = %p, want %p", server, got, want)
+			}
+		})
+	}
+}
+
 func (s) TestNewServer_Success(t *testing.T) {
 	xdsCreds, err := xds.NewServerCredentials(xds.ServerOptions{FallbackCreds: insecure.NewCredentials()})
 	if err != nil {
@@ -136,9 +181,9 @@ func (s) TestNewServer_Success(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.desc, func(t *testing.T) {
-			// The xds package adds a couple of server options (unary and stream
-			// interceptors) to the server options passed in by the user.
-			wantServerOpts := len(test.serverOpts) + 2
+			// The xds package adds 1 server option (stream wrapper) to the server
+			// options passed in by the user.
+			wantServerOpts := len(test.serverOpts) + 1
 
 			origNewGRPCServer := newGRPCServer
 			newGRPCServer = func(opts ...grpc.ServerOption) grpcServer {
@@ -146,8 +191,8 @@ func (s) TestNewServer_Success(t *testing.T) {
 					t.Fatalf("%d ServerOptions passed to grpc.Server, want %d", got, wantServerOpts)
 				}
 				// Verify that the user passed ServerOptions are forwarded as is.
-				if !reflect.DeepEqual(opts[2:], test.serverOpts) {
-					t.Fatalf("got ServerOptions %v, want %v", opts[2:], test.serverOpts)
+				if diff := cmp.Diff(test.serverOpts, opts[1:], cmp.Comparer(func(a, b grpc.ServerOption) bool { return a == b })); diff != "" {
+					t.Fatalf("ServerOptions mismatch (-want +got):\n%s", diff)
 				}
 				return grpc.NewServer(opts...)
 			}
@@ -177,14 +222,14 @@ func (s) TestNewServer_Failure(t *testing.T) {
 	}{
 		{
 			desc:       "bootstrap env var not set",
-			serverOpts: []grpc.ServerOption{grpc.Creds(xdsCreds)},
-			wantErr:    "bootstrap env vars are unspecified",
+			serverOpts: []grpc.ServerOption{grpc.Creds(xdsCreds), BootstrapContentsForTesting(nil)},
+			wantErr:    "failed to read xDS bootstrap config from env vars",
 		},
 		{
 			desc: "empty bootstrap config",
 			serverOpts: []grpc.ServerOption{
 				grpc.Creds(xdsCreds),
-				BootstrapContentsForTesting([]byte(`{}`)),
+				BootstrapContentsForTesting(nil),
 			},
 			wantErr: "xDS client creation failed",
 		},
@@ -194,11 +239,11 @@ func (s) TestNewServer_Failure(t *testing.T) {
 				grpc.Creds(xdsCreds),
 				func() grpc.ServerOption {
 					bs, err := bootstrap.NewContentsForTesting(bootstrap.ConfigOptionsForTesting{
-						Servers: []json.RawMessage{[]byte(fmt.Sprintf(`{
+						Servers: []byte(fmt.Sprintf(`[{
 							"server_uri": %q,
 							"channel_creds": [{"type": "insecure"}]
-						}`, nonExistentManagementServer))},
-						NodeID: uuid.New().String(),
+						}]`, nonExistentManagementServer)),
+						Node: []byte(fmt.Sprintf(`{"id": "%s"}`, uuid.New().String())),
 						CertificateProviders: map[string]json.RawMessage{
 							"cert-provider-instance": json.RawMessage("{}"),
 						},
@@ -227,11 +272,89 @@ func (s) TestNewServer_Failure(t *testing.T) {
 	}
 }
 
+// TestServer_OverrideListenerResourceNameOverridesMissingTemplate verifies
+// that an internal listener resource name override takes precedence over
+// server_listener_resource_name_template from bootstrap, including when the
+// template is absent, and that its returned name is used for the LDS watch.
+func (s) TestServer_OverrideListenerResourceNameOverridesMissingTemplate(t *testing.T) {
+	const wantResourceName = "xdstp://foo/bar"
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+
+	ldsResourceNamesCh := make(chan []string, 1)
+	mgmtServer := e2e.StartManagementServer(t, e2e.ManagementServerOptions{
+		OnStreamRequest: func(_ int64, req *v3discoverypb.DiscoveryRequest) error {
+			if req.GetTypeUrl() == version.V3ListenerURL {
+				select {
+				case ldsResourceNamesCh <- req.GetResourceNames():
+				case <-ctx.Done():
+				}
+			}
+			return nil
+		},
+	})
+
+	bs, err := bootstrap.NewContentsForTesting(bootstrap.ConfigOptionsForTesting{
+		Servers: []byte(fmt.Sprintf(`[{
+			"server_uri": %q,
+			"channel_creds": [{"type": "insecure"}]
+		}]`, mgmtServer.Address)),
+		Node: []byte(fmt.Sprintf(`{"id": "%s"}`, uuid.New().String())),
+	})
+	if err != nil {
+		t.Fatalf("Failed to create bootstrap configuration: %v", err)
+	}
+
+	fs := newFakeGRPCServer()
+	origNewGRPCServer := newGRPCServer
+	newGRPCServer = func(...grpc.ServerOption) grpcServer { return fs }
+	defer func() { newGRPCServer = origNewGRPCServer }()
+
+	lisAddrCh := make(chan net.Addr, 1)
+	resourceNameOpt := internalserver.OverrideListenerResourceName(func(addr net.Addr) string {
+		lisAddrCh <- addr
+		return wantResourceName
+	})
+	srv, err := NewGRPCServer(resourceNameOpt, BootstrapContentsForTesting(bs))
+	if err != nil {
+		t.Fatalf("NewGRPCServer() failed: %v", err)
+	}
+	defer srv.Stop()
+
+	lis, err := testutils.LocalTCPListener()
+	if err != nil {
+		t.Fatalf("testutils.LocalTCPListener() failed: %v", err)
+	}
+	go func() { _ = srv.Serve(lis) }()
+
+	// Verify that OverrideListenerResourceName receives the listener address.
+	select {
+	case gotAddr := <-lisAddrCh:
+		if gotAddr.String() != lis.Addr().String() {
+			t.Fatalf("OverrideListenerResourceName() called with address %q, want %q", gotAddr, lis.Addr())
+		}
+	case <-ctx.Done():
+		t.Fatal("Timeout waiting for OverrideListenerResourceName to be called")
+	}
+
+	// Verify that the LDS watch uses the resource name returned by the override.
+	var gotResourceNames []string
+	select {
+	case gotResourceNames = <-ldsResourceNamesCh:
+	case <-ctx.Done():
+		t.Fatal("Timeout waiting for an LDS request")
+	}
+	wantResourceNames := []string{wantResourceName}
+	if !cmp.Equal(gotResourceNames, wantResourceNames) {
+		t.Fatalf("LDS watch registered for names %v, want %v", gotResourceNames, wantResourceNames)
+	}
+}
+
 func (s) TestRegisterService(t *testing.T) {
 	fs := newFakeGRPCServer()
 
 	origNewGRPCServer := newGRPCServer
-	newGRPCServer = func(opts ...grpc.ServerOption) grpcServer { return fs }
+	newGRPCServer = func(...grpc.ServerOption) grpcServer { return fs }
 	defer func() { newGRPCServer = origNewGRPCServer }()
 
 	s, err := NewGRPCServer(BootstrapContentsForTesting(generateBootstrapContents(t, uuid.NewString(), "non-existent-management-server")))
@@ -355,7 +478,7 @@ func (s) TestServeSuccess(t *testing.T) {
 	// request is received by it.
 	ldsRequestCh := make(chan []string, 1)
 	mgmtServer := e2e.StartManagementServer(t, e2e.ManagementServerOptions{
-		OnStreamRequest: func(id int64, req *v3discoverypb.DiscoveryRequest) error {
+		OnStreamRequest: func(_ int64, req *v3discoverypb.DiscoveryRequest) error {
 			if req.GetTypeUrl() == version.V3ListenerURL {
 				select {
 				case ldsRequestCh <- req.GetResourceNames():
@@ -374,7 +497,7 @@ func (s) TestServeSuccess(t *testing.T) {
 	// test to verify that Serve() is called on the underlying server.
 	fs := newFakeGRPCServer()
 	origNewGRPCServer := newGRPCServer
-	newGRPCServer = func(opts ...grpc.ServerOption) grpcServer { return fs }
+	newGRPCServer = func(...grpc.ServerOption) grpcServer { return fs }
 	defer func() { newGRPCServer = origNewGRPCServer }()
 
 	// Create a new xDS enabled gRPC server and pass it a server option to get
@@ -410,7 +533,7 @@ func (s) TestServeSuccess(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatalf("Timeout when waiting for an LDS request to be sent out")
 	}
-	wantNames := []string{strings.Replace(e2e.ServerListenerResourceNameTemplate, "%s", lis.Addr().String(), -1)}
+	wantNames := []string{strings.ReplaceAll(e2e.ServerListenerResourceNameTemplate, "%s", lis.Addr().String())}
 	if !cmp.Equal(gotNames, wantNames) {
 		t.Fatalf("LDS watch registered for names %v, want %v", gotNames, wantNames)
 	}
@@ -442,6 +565,10 @@ func (s) TestServeSuccess(t *testing.T) {
 	// Update the listener resource on the management server in such a way that
 	// it will be NACKed by our xDS client. The listener_filters field is
 	// unsupported and will be NACKed.
+	resources = e2e.UpdateOptions{
+		NodeID:    nodeID,
+		Listeners: []*v3listenerpb.Listener{e2e.DefaultServerListener(host, port, e2e.SecurityLevelNone, "routeName")},
+	}
 	resources.Listeners[0].ListenerFilters = []*v3listenerpb.ListenerFilter{{Name: "foo"}}
 	if err := mgmtServer.Update(ctx, resources); err != nil {
 		t.Fatal(err)
@@ -474,11 +601,9 @@ func (s) TestServeSuccess(t *testing.T) {
 // TestNewServer_ClientCreationFailure tests the case where the xDS client
 // creation fails and verifies that the call to NewGRPCServer() fails.
 func (s) TestNewServer_ClientCreationFailure(t *testing.T) {
-	origNewXDSClient := newXDSClient
-	newXDSClient = func() (xdsclient.XDSClient, func(), error) {
-		return nil, nil, errors.New("xdsClient creation failed")
-	}
-	defer func() { newXDSClient = origNewXDSClient }()
+	origXDSClientPool := xdsClientPool
+	xdsClientPool = xdsclient.NewPool(nil)
+	defer func() { xdsClientPool = origXDSClientPool }()
 
 	if _, err := NewGRPCServer(); err == nil {
 		t.Fatal("NewGRPCServer() succeeded when expected to fail")
@@ -496,11 +621,11 @@ func (s) TestHandleListenerUpdate_NoXDSCreds(t *testing.T) {
 	// providers.
 	nodeID := uuid.NewString()
 	bootstrapContents, err := bootstrap.NewContentsForTesting(bootstrap.ConfigOptionsForTesting{
-		Servers: []json.RawMessage{[]byte(fmt.Sprintf(`{
+		Servers: []byte(fmt.Sprintf(`[{
 			"server_uri": %q,
 			"channel_creds": [{"type": "insecure"}]
-		}`, mgmtServer.Address))},
-		NodeID: nodeID,
+		}]`, mgmtServer.Address)),
+		Node: []byte(fmt.Sprintf(`{"id": "%s"}`, nodeID)),
 		CertificateProviders: map[string]json.RawMessage{
 			e2e.ServerSideCertProviderInstance: fakeProvider1Config,
 			e2e.ClientSideCertProviderInstance: fakeProvider2Config,
@@ -572,7 +697,7 @@ func (s) TestHandleListenerUpdate_ErrorUpdate(t *testing.T) {
 	// request is received by it.
 	ldsRequestCh := make(chan []string, 1)
 	mgmtServer := e2e.StartManagementServer(t, e2e.ManagementServerOptions{
-		OnStreamRequest: func(id int64, req *v3discoverypb.DiscoveryRequest) error {
+		OnStreamRequest: func(_ int64, req *v3discoverypb.DiscoveryRequest) error {
 			if req.GetTypeUrl() == version.V3ListenerURL {
 				select {
 				case ldsRequestCh <- req.GetResourceNames():
@@ -588,11 +713,11 @@ func (s) TestHandleListenerUpdate_ErrorUpdate(t *testing.T) {
 	// providers.
 	nodeID := uuid.New().String()
 	bootstrapContents, err := bootstrap.NewContentsForTesting(bootstrap.ConfigOptionsForTesting{
-		Servers: []json.RawMessage{[]byte(fmt.Sprintf(`{
+		Servers: []byte(fmt.Sprintf(`[{
 			"server_uri": %q,
 			"channel_creds": [{"type": "insecure"}]
-		}`, mgmtServer.Address))},
-		NodeID: nodeID,
+		}]`, mgmtServer.Address)),
+		Node: []byte(fmt.Sprintf(`{"id": "%s"}`, nodeID)),
 		CertificateProviders: map[string]json.RawMessage{
 			e2e.ServerSideCertProviderInstance: fakeProvider1Config,
 			e2e.ClientSideCertProviderInstance: fakeProvider2Config,
@@ -608,8 +733,11 @@ func (s) TestHandleListenerUpdate_ErrorUpdate(t *testing.T) {
 	// configuration to be used during xDS client creation.
 	modeChangeCh := testutils.NewChannel()
 	modeChangeOption := ServingModeCallback(func(addr net.Addr, args ServingModeChangeArgs) {
+		// The serving mode callback may be invoked multiple times as the xDS
+		// client NACKs the updates and the management server responds back with
+		// the same version of the LDS resource.
 		t.Logf("Server mode change callback invoked for listener %q with mode %q and error %v", addr.String(), args.Mode, args.Err)
-		modeChangeCh.Send(args.Mode)
+		modeChangeCh.Replace(args.Mode)
 	})
 	server, err := NewGRPCServer(modeChangeOption, BootstrapContentsForTesting(bootstrapContents))
 	if err != nil {
@@ -647,7 +775,7 @@ func (s) TestHandleListenerUpdate_ErrorUpdate(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatalf("Timeout when waiting for an LDS request to be sent out")
 	}
-	wantNames := []string{strings.Replace(e2e.ServerListenerResourceNameTemplate, "%s", lis.Addr().String(), -1)}
+	wantNames := []string{strings.ReplaceAll(e2e.ServerListenerResourceNameTemplate, "%s", lis.Addr().String())}
 	if !cmp.Equal(gotNames, wantNames) {
 		t.Fatalf("LDS watch registered for names %v, want %v", gotNames, wantNames)
 	}
@@ -657,15 +785,15 @@ func (s) TestHandleListenerUpdate_ErrorUpdate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Also make sure that no serving mode updates are received. The serving
-	// mode does not change until the server comes to the conclusion that the
-	// requested resource is not present in the management server. This happens
-	// when the watch timer expires or when the resource is explicitly deleted
-	// by the management server.
-	sCtx, sCancel := context.WithTimeout(context.Background(), defaultTestShortTimeout)
-	defer sCancel()
-	if _, err := modeChangeCh.Receive(sCtx); err != context.DeadlineExceeded {
-		t.Fatal("Serving mode changed received when none expected")
+	// Also make sure that serving mode updates are received. The serving
+	// mode changes to NOT_SERVING. This happens because watcher received a
+	// resource error for the invalid resource from the server.
+	mode, err := modeChangeCh.Receive(ctx)
+	if err == context.DeadlineExceeded {
+		t.Fatal("Serving mode did not change when expected to change")
+	}
+	if mode != connectivity.ServingModeNotServing {
+		t.Fatalf("Serving mode = %q, want %q", mode, connectivity.ServingModeNotServing)
 	}
 }
 
@@ -696,18 +824,32 @@ func (s) TestServeAndCloseDoNotRace(t *testing.T) {
 		t.Fatalf("testutils.LocalTCPListener() failed: %v", err)
 	}
 
+	// Generate bootstrap contents up front for all servers.
+	bootstrapContents := generateBootstrapContents(t, uuid.NewString(), nonExistentManagementServer)
+
+	// Override the default ServingModeCallback with a noop function because the
+	// serverURI is invalid which will result in xDS channel creation failure
+	// while registering the watch for listener resource. This will trigger
+	// resource error notifications for the invalid listener resource leading
+	// to service mode change to "not serving" each time.
+	//
+	// Even if the server is currently NOT_SERVING and the new mode is also
+	// NOT_SERVING, the update is not suppressed as:
+	//   1. the error may have change
+	//   2. it provides a timestamp of the last backoff attempt
+	noopModeChangeCallback := func(_ net.Addr, _ ServingModeChangeArgs) {}
+
 	wg := sync.WaitGroup{}
+	wg.Add(200)
 	for i := 0; i < 100; i++ {
-		server, err := NewGRPCServer(BootstrapContentsForTesting(generateBootstrapContents(t, uuid.NewString(), nonExistentManagementServer)))
+		server, err := NewGRPCServer(BootstrapContentsForTesting(bootstrapContents), ServingModeCallback(noopModeChangeCallback))
 		if err != nil {
 			t.Fatalf("Failed to create an xDS enabled gRPC server: %v", err)
 		}
-		wg.Add(1)
 		go func() {
 			server.Serve(lis)
 			wg.Done()
 		}()
-		wg.Add(1)
 		go func() {
 			server.Stop()
 			wg.Done()

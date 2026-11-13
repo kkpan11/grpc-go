@@ -16,7 +16,8 @@
  *
  */
 
-// Binary client is an example client.
+// Binary client demonstrates how to use interceptors to observe or control the
+// behavior of gRPC including logging, authentication,metrics collection, etc.
 package main
 
 import (
@@ -159,7 +160,7 @@ func main() {
 	}
 	defer conn.Close()
 
-	// Make a echo client and send RPCs.
+	// Make an echo client and send RPCs.
 	rgc := ecpb.NewEchoClient(conn)
 	callUnaryEcho(rgc, "hello world")
 	callBidiStreamingEcho(rgc)

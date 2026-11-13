@@ -26,6 +26,7 @@ import (
 	"github.com/envoyproxy/go-control-plane/pkg/wellknown"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	v3clusterpb "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
@@ -63,10 +64,15 @@ const (
 	// is required. Only the server presents an identity certificate in this
 	// configuration.
 	SecurityLevelTLS
-	// SecurityLevelMTLS is used when security ocnfiguration corresponding to
+	// SecurityLevelMTLS is used when security configuration corresponding to
 	// mTLS is required. Both client and server present identity certificates in
 	// this configuration.
 	SecurityLevelMTLS
+	// SecurityLevelTLSWithSystemRootCerts is used when security configuration
+	// corresponding to TLS is required. Only the server presents an identity
+	// certificate in this configuration and the client uses system root certs
+	// to validate the server certificate.
+	SecurityLevelTLSWithSystemRootCerts
 )
 
 // ResourceParams wraps the arguments to be passed to DefaultClientResources.
@@ -133,72 +139,6 @@ func marshalAny(m proto.Message) *anypb.Any {
 		panic(fmt.Sprintf("anypb.New(%+v) failed: %v", m, err))
 	}
 	return a
-}
-
-// filterChainWontMatch returns a filter chain that won't match if running the
-// test locally.
-func filterChainWontMatch(routeName string, addressPrefix string, srcPorts []uint32) *v3listenerpb.FilterChain {
-	hcm := &v3httppb.HttpConnectionManager{
-		RouteSpecifier: &v3httppb.HttpConnectionManager_Rds{
-			Rds: &v3httppb.Rds{
-				ConfigSource: &v3corepb.ConfigSource{
-					ConfigSourceSpecifier: &v3corepb.ConfigSource_Ads{Ads: &v3corepb.AggregatedConfigSource{}},
-				},
-				RouteConfigName: routeName,
-			},
-		},
-		HttpFilters: []*v3httppb.HttpFilter{RouterHTTPFilter},
-	}
-	return &v3listenerpb.FilterChain{
-		Name: routeName + "-wont-match",
-		FilterChainMatch: &v3listenerpb.FilterChainMatch{
-			PrefixRanges: []*v3corepb.CidrRange{
-				{
-					AddressPrefix: addressPrefix,
-					PrefixLen: &wrapperspb.UInt32Value{
-						Value: uint32(0),
-					},
-				},
-			},
-			SourceType:  v3listenerpb.FilterChainMatch_SAME_IP_OR_LOOPBACK,
-			SourcePorts: srcPorts,
-			SourcePrefixRanges: []*v3corepb.CidrRange{
-				{
-					AddressPrefix: addressPrefix,
-					PrefixLen: &wrapperspb.UInt32Value{
-						Value: uint32(0),
-					},
-				},
-			},
-		},
-		Filters: []*v3listenerpb.Filter{
-			{
-				Name:       "filter-1",
-				ConfigType: &v3listenerpb.Filter_TypedConfig{TypedConfig: marshalAny(hcm)},
-			},
-		},
-	}
-}
-
-// ListenerResourceThreeRouteResources returns a listener resource that points
-// to three route configurations. Only the filter chain that points to the first
-// route config can be matched to.
-func ListenerResourceThreeRouteResources(host string, port uint32, secLevel SecurityLevel, routeName string) *v3listenerpb.Listener {
-	lis := defaultServerListenerCommon(host, port, secLevel, routeName, false)
-	lis.FilterChains = append(lis.FilterChains, filterChainWontMatch("routeName2", "1.1.1.1", []uint32{1}))
-	lis.FilterChains = append(lis.FilterChains, filterChainWontMatch("routeName3", "2.2.2.2", []uint32{2}))
-	return lis
-}
-
-// ListenerResourceFallbackToDefault returns a listener resource that contains a
-// filter chain that will never get chosen to process traffic and a default
-// filter chain. The default filter chain points to routeName2.
-func ListenerResourceFallbackToDefault(host string, port uint32, secLevel SecurityLevel) *v3listenerpb.Listener {
-	lis := defaultServerListenerCommon(host, port, secLevel, "", false)
-	lis.FilterChains = nil
-	lis.FilterChains = append(lis.FilterChains, filterChainWontMatch("routeName", "1.1.1.1", []uint32{1}))
-	lis.DefaultFilterChain = filterChainWontMatch("routeName2", "2.2.2.2", []uint32{2})
-	return lis
 }
 
 // DefaultServerListener returns a basic xds Listener resource to be used on the
@@ -593,6 +533,16 @@ func ClusterResourceWithOptions(opts ClusterOptions) *v3clusterpb.Cluster {
 				},
 			},
 		}
+	case SecurityLevelTLSWithSystemRootCerts:
+		tlsContext = &v3tlspb.UpstreamTlsContext{
+			CommonTlsContext: &v3tlspb.CommonTlsContext{
+				ValidationContextType: &v3tlspb.CommonTlsContext_ValidationContext{
+					ValidationContext: &v3tlspb.CertificateValidationContext{
+						SystemRootCerts: &v3tlspb.CertificateValidationContext_SystemRootCerts{},
+					},
+				},
+			},
+		}
 	}
 
 	var lbPolicy v3clusterpb.Cluster_LbPolicy
@@ -667,6 +617,13 @@ func ClusterResourceWithOptions(opts ClusterOptions) *v3clusterpb.Cluster {
 	return cluster
 }
 
+// LocalityID represents a locality identifier.
+type LocalityID struct {
+	Region  string
+	Zone    string
+	SubZone string
+}
+
 // LocalityOptions contains options to configure a Locality.
 type LocalityOptions struct {
 	// Name is the unique locality name.
@@ -677,19 +634,27 @@ type LocalityOptions struct {
 	Backends []BackendOptions
 	// Priority is the priority of the locality. Defaults to 0.
 	Priority uint32
+	// Locality is the locality identifier. If not specified, a random
+	// identifier is generated.
+	Locality LocalityID
 }
 
 // BackendOptions contains options to configure individual backends in a
 // locality.
 type BackendOptions struct {
-	// Port number on which the backend is accepting connections. All backends
+	// Ports on which the backend is accepting connections. All backends
 	// are expected to run on localhost, hence host name is not stored here.
-	Port uint32
+	Ports []uint32
 	// Health status of the backend. Default is UNKNOWN which is treated the
 	// same as HEALTHY.
 	HealthStatus v3corepb.HealthStatus
 	// Weight sets the backend weight. Defaults to 1.
 	Weight uint32
+	// Hostname sets the endpoint hostname for authority rewriting.
+	Hostname string
+	// Metadata sets the LB endpoint metadata (envoy.lb FilterMetadata field).
+	// See https://www.envoyproxy.io/docs/envoy/latest/api-v3/config/core/v3/base.proto#envoy-v3-api-msg-config-core-v3-metadata
+	Metadata map[string]any
 }
 
 // EndpointOptions contains options to configure an Endpoint (or
@@ -712,7 +677,7 @@ type EndpointOptions struct {
 func DefaultEndpoint(clusterName string, host string, ports []uint32) *v3endpointpb.ClusterLoadAssignment {
 	var bOpts []BackendOptions
 	for _, p := range ports {
-		bOpts = append(bOpts, BackendOptions{Port: p, Weight: 1})
+		bOpts = append(bOpts, BackendOptions{Ports: []uint32{p}, Weight: 1})
 	}
 	return EndpointResourceWithOptions(EndpointOptions{
 		ClusterName: clusterName,
@@ -737,27 +702,58 @@ func EndpointResourceWithOptions(opts EndpointOptions) *v3endpointpb.ClusterLoad
 			if b.Weight == 0 {
 				b.Weight = 1
 			}
-			lbEndpoints = append(lbEndpoints, &v3endpointpb.LbEndpoint{
+			additionalAddresses := make([]*v3endpointpb.Endpoint_AdditionalAddress, len(b.Ports)-1)
+			for i, p := range b.Ports[1:] {
+				additionalAddresses[i] = &v3endpointpb.Endpoint_AdditionalAddress{
+					Address: &v3corepb.Address{Address: &v3corepb.Address_SocketAddress{
+						SocketAddress: &v3corepb.SocketAddress{
+							Protocol:      v3corepb.SocketAddress_TCP,
+							Address:       opts.Host,
+							PortSpecifier: &v3corepb.SocketAddress_PortValue{PortValue: p},
+						}},
+					},
+				}
+			}
+			lbEndpoint := &v3endpointpb.LbEndpoint{
 				HostIdentifier: &v3endpointpb.LbEndpoint_Endpoint{Endpoint: &v3endpointpb.Endpoint{
 					Address: &v3corepb.Address{Address: &v3corepb.Address_SocketAddress{
 						SocketAddress: &v3corepb.SocketAddress{
 							Protocol:      v3corepb.SocketAddress_TCP,
 							Address:       opts.Host,
-							PortSpecifier: &v3corepb.SocketAddress_PortValue{PortValue: b.Port},
+							PortSpecifier: &v3corepb.SocketAddress_PortValue{PortValue: b.Ports[0]},
 						},
 					}},
+					Hostname:            b.Hostname,
+					AdditionalAddresses: additionalAddresses,
 				}},
 				HealthStatus:        b.HealthStatus,
 				LoadBalancingWeight: &wrapperspb.UInt32Value{Value: b.Weight},
-			})
+			}
+
+			if b.Metadata != nil {
+				metadata, err := structpb.NewStruct(b.Metadata)
+				if err != nil {
+					panic(fmt.Sprintf("failed to marshal metadata: %v", err))
+				}
+				lbEndpoint.Metadata = &v3corepb.Metadata{
+					FilterMetadata: map[string]*structpb.Struct{
+						"envoy.lb": metadata,
+					},
+				}
+			}
+			lbEndpoints = append(lbEndpoints, lbEndpoint)
 		}
 
-		endpoints = append(endpoints, &v3endpointpb.LocalityLbEndpoints{
-			Locality: &v3corepb.Locality{
+		l := locality.Locality
+		if l == (LocalityID{}) {
+			l = LocalityID{
 				Region:  fmt.Sprintf("region-%d", i+1),
 				Zone:    fmt.Sprintf("zone-%d", i+1),
 				SubZone: fmt.Sprintf("subzone-%d", i+1),
-			},
+			}
+		}
+		endpoints = append(endpoints, &v3endpointpb.LocalityLbEndpoints{
+			Locality:            &v3corepb.Locality{Region: l.Region, Zone: l.Zone, SubZone: l.SubZone},
 			LbEndpoints:         lbEndpoints,
 			LoadBalancingWeight: &wrapperspb.UInt32Value{Value: locality.Weight},
 			Priority:            locality.Priority,
@@ -789,7 +785,7 @@ func EndpointResourceWithOptions(opts EndpointOptions) *v3endpointpb.ClusterLoad
 
 // DefaultServerListenerWithRouteConfigName returns a basic xds Listener
 // resource to be used on the server side. The returned Listener resource
-// contains a RouteCongiguration resource name that needs to be resolved.
+// contains a RouteConfiguration resource name that needs to be resolved.
 func DefaultServerListenerWithRouteConfigName(host string, port uint32, secLevel SecurityLevel, routeName string) *v3listenerpb.Listener {
 	return defaultServerListenerCommon(host, port, secLevel, routeName, false)
 }

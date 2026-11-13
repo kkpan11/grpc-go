@@ -184,12 +184,14 @@ func (s) TestRefuseStartWithInvalidPatterns(t *testing.T) {
 		envconfig.ObservabilityConfigFile = oldObservabilityConfigFile
 	}()
 	// If there is at least one invalid pattern, which should not be silently tolerated.
-	if err := Start(context.Background()); err == nil {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	if err := Start(ctx); err == nil {
 		t.Fatalf("Invalid patterns not triggering error")
 	}
 }
 
-// TestRefuseStartWithExcludeAndWildCardAll tests the sceanrio where an
+// TestRefuseStartWithExcludeAndWildCardAll tests the scenario where an
 // observability configuration is provided with client RPC event specifying to
 // exclude, and which matches on the '*' wildcard (any). This should cause an
 // error when trying to start the observability system.
@@ -220,7 +222,9 @@ func (s) TestRefuseStartWithExcludeAndWildCardAll(t *testing.T) {
 		envconfig.ObservabilityConfigFile = oldObservabilityConfigFile
 	}()
 	// If there is at least one invalid pattern, which should not be silently tolerated.
-	if err := Start(context.Background()); err == nil {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	if err := Start(ctx); err == nil {
 		t.Fatalf("Invalid patterns not triggering error")
 	}
 }
@@ -316,7 +320,9 @@ func (s) TestBothConfigEnvVarsSet(t *testing.T) {
 	defer func() {
 		envconfig.ObservabilityConfig = oldObservabilityConfig
 	}()
-	if err := Start(context.Background()); err == nil {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	if err := Start(ctx); err == nil {
 		t.Fatalf("Invalid patterns not triggering error")
 	}
 }
@@ -331,7 +337,9 @@ func (s) TestErrInFileSystemEnvVar(t *testing.T) {
 	defer func() {
 		envconfig.ObservabilityConfigFile = oldObservabilityConfigFile
 	}()
-	if err := Start(context.Background()); err == nil {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	if err := Start(ctx); err == nil {
 		t.Fatalf("Invalid file system path not triggering error")
 	}
 }
@@ -346,7 +354,9 @@ func (s) TestNoEnvSet(t *testing.T) {
 		envconfig.ObservabilityConfigFile = oldObservabilityConfigFile
 	}()
 	// If there is no observability config set at all, the Start should return an error.
-	if err := Start(context.Background()); err == nil {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	if err := Start(ctx); err == nil {
 		t.Fatalf("Invalid patterns not triggering error")
 	}
 }
@@ -359,7 +369,7 @@ func (s) TestOpenCensusIntegration(t *testing.T) {
 		newExporter = ne
 	}(newExporter)
 
-	newExporter = func(config *config) (tracingMetricsExporter, error) {
+	newExporter = func(*config) (tracingMetricsExporter, error) {
 		return fe, nil
 	}
 
@@ -377,7 +387,7 @@ func (s) TestOpenCensusIntegration(t *testing.T) {
 	defer cleanup()
 
 	ss := &stubserver.StubServer{
-		UnaryCallF: func(ctx context.Context, in *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+		UnaryCallF: func(context.Context, *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
 			return &testpb.SimpleResponse{}, nil
 		},
 		FullDuplexCallF: func(stream testgrpc.TestService_FullDuplexCallServer) error {
@@ -540,7 +550,9 @@ func (s) TestStartErrorsThenEnd(t *testing.T) {
 		envconfig.ObservabilityConfig = oldObservabilityConfig
 		envconfig.ObservabilityConfigFile = oldObservabilityConfigFile
 	}()
-	if err := Start(context.Background()); err == nil {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	if err := Start(ctx); err == nil {
 		t.Fatalf("Invalid patterns not triggering error")
 	}
 	End()
@@ -557,7 +569,7 @@ func (s) TestLoggingLinkedWithTraceClientSide(t *testing.T) {
 		newLoggingExporter = oldNewLoggingExporter
 	}()
 
-	newLoggingExporter = func(ctx context.Context, config *config) (loggingExporter, error) {
+	newLoggingExporter = func(context.Context, *config) (loggingExporter, error) {
 		return fle, nil
 	}
 
@@ -572,7 +584,7 @@ func (s) TestLoggingLinkedWithTraceClientSide(t *testing.T) {
 		newExporter = oldNewExporter
 	}()
 
-	newExporter = func(config *config) (tracingMetricsExporter, error) {
+	newExporter = func(*config) (tracingMetricsExporter, error) {
 		return fe, nil
 	}
 
@@ -598,7 +610,7 @@ func (s) TestLoggingLinkedWithTraceClientSide(t *testing.T) {
 	}
 	defer cleanup()
 	ss := &stubserver.StubServer{
-		UnaryCallF: func(ctx context.Context, in *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+		UnaryCallF: func(context.Context, *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
 			return &testpb.SimpleResponse{}, nil
 		},
 		FullDuplexCallF: func(stream testgrpc.TestService_FullDuplexCallServer) error {
@@ -699,7 +711,7 @@ func (s) TestLoggingLinkedWithTraceServerSide(t *testing.T) {
 		newLoggingExporter = oldNewLoggingExporter
 	}()
 
-	newLoggingExporter = func(ctx context.Context, config *config) (loggingExporter, error) {
+	newLoggingExporter = func(context.Context, *config) (loggingExporter, error) {
 		return fle, nil
 	}
 
@@ -714,7 +726,7 @@ func (s) TestLoggingLinkedWithTraceServerSide(t *testing.T) {
 		newExporter = oldNewExporter
 	}()
 
-	newExporter = func(config *config) (tracingMetricsExporter, error) {
+	newExporter = func(*config) (tracingMetricsExporter, error) {
 		return fe, nil
 	}
 
@@ -740,7 +752,7 @@ func (s) TestLoggingLinkedWithTraceServerSide(t *testing.T) {
 	}
 	defer cleanup()
 	ss := &stubserver.StubServer{
-		UnaryCallF: func(ctx context.Context, in *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+		UnaryCallF: func(context.Context, *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
 			return &testpb.SimpleResponse{}, nil
 		},
 		FullDuplexCallF: func(stream testgrpc.TestService_FullDuplexCallServer) error {
@@ -843,7 +855,7 @@ func (s) TestLoggingLinkedWithTrace(t *testing.T) {
 		newLoggingExporter = oldNewLoggingExporter
 	}()
 
-	newLoggingExporter = func(ctx context.Context, config *config) (loggingExporter, error) {
+	newLoggingExporter = func(context.Context, *config) (loggingExporter, error) {
 		return fle, nil
 	}
 
@@ -858,7 +870,7 @@ func (s) TestLoggingLinkedWithTrace(t *testing.T) {
 		newExporter = oldNewExporter
 	}()
 
-	newExporter = func(config *config) (tracingMetricsExporter, error) {
+	newExporter = func(*config) (tracingMetricsExporter, error) {
 		return fe, nil
 	}
 
@@ -891,7 +903,7 @@ func (s) TestLoggingLinkedWithTrace(t *testing.T) {
 	}
 	defer cleanup()
 	ss := &stubserver.StubServer{
-		UnaryCallF: func(ctx context.Context, in *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+		UnaryCallF: func(context.Context, *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
 			return &testpb.SimpleResponse{}, nil
 		},
 		FullDuplexCallF: func(stream testgrpc.TestService_FullDuplexCallServer) error {

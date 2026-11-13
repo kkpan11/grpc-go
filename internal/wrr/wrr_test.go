@@ -20,7 +20,7 @@ package wrr
 import (
 	"errors"
 	"math"
-	"math/rand"
+	rand "math/rand/v2"
 	"strconv"
 	"testing"
 
@@ -50,7 +50,7 @@ func equalApproximate(a, b float64) error {
 	return nil
 }
 
-func testWRRNext(t *testing.T, newWRR func() WRR) {
+func (s) TestRandomWRRNext(t *testing.T) {
 	tests := []struct {
 		name    string
 		weights []int64
@@ -78,7 +78,7 @@ func testWRRNext(t *testing.T, newWRR func() WRR) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			w := newWRR()
+			w := NewRandom()
 			if len(tt.weights) == 0 {
 				if next := w.Next(); next != nil {
 					t.Fatalf("w.Next returns non nil value:%v when there is no item", next)
@@ -115,14 +115,6 @@ func testWRRNext(t *testing.T, newWRR func() WRR) {
 	}
 }
 
-func (s) TestRandomWRRNext(t *testing.T) {
-	testWRRNext(t, NewRandom)
-}
-
-func (s) TestEdfWrrNext(t *testing.T) {
-	testWRRNext(t, NewEDF)
-}
-
 func BenchmarkRandomWRRNext(b *testing.B) {
 	for _, n := range []int{100, 500, 1000} {
 		b.Run("equal-weights-"+strconv.Itoa(n)+"-items", func(b *testing.B) {
@@ -146,7 +138,7 @@ func BenchmarkRandomWRRNext(b *testing.B) {
 			w := NewRandom()
 			var sumOfWeights int64
 			for i := 0; i < n; i++ {
-				weight := rand.Int63n(maxWeight + 1)
+				weight := rand.Int64N(maxWeight + 1)
 				w.Add(i, weight)
 				sumOfWeights += weight
 			}
@@ -188,6 +180,6 @@ func BenchmarkRandomWRRNext(b *testing.B) {
 }
 
 func init() {
-	r := rand.New(rand.NewSource(0))
-	randInt63n = r.Int63n
+	r := rand.New(rand.NewPCG(0, 0))
+	randInt64n = r.Int64N
 }

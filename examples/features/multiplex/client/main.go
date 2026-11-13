@@ -16,7 +16,8 @@
  *
  */
 
-// Binary client is an example client.
+// Binary client demonstrates how to use a single grpc.ClientConn for multiple
+// service stubs.
 package main
 
 import (
@@ -72,7 +73,7 @@ func main() {
 
 	fmt.Println()
 	fmt.Println("--- calling routeguide.RouteGuide/GetFeature ---")
-	// Make a routeguild client with the same ClientConn.
+	// Make a routeguide client with the same ClientConn.
 	rgc := ecpb.NewEchoClient(conn)
 	callUnaryEcho(rgc, "this is examples/multiplex")
 }

@@ -16,20 +16,23 @@
  *
  */
 
+// Binary server is a server for the CSM Observability example.
 package main
 
 import (
 	"context"
 	"flag"
-	"fmt"
 	"log"
 	"net"
 	"net/http"
 
 	"google.golang.org/grpc"
-	pb "google.golang.org/grpc/examples/features/proto/echo"
+	"google.golang.org/grpc/credentials/insecure"
+	xdscreds "google.golang.org/grpc/credentials/xds"
+	pb "google.golang.org/grpc/examples/helloworld/helloworld"
 	"google.golang.org/grpc/stats/opentelemetry"
 	"google.golang.org/grpc/stats/opentelemetry/csm"
+	"google.golang.org/grpc/xds"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.opentelemetry.io/otel/exporters/prometheus"
@@ -41,13 +44,15 @@ var (
 	prometheusEndpoint = flag.String("prometheus_endpoint", ":9464", "the Prometheus exporter endpoint")
 )
 
-type echoServer struct {
-	pb.UnimplementedEchoServer
+// server is used to implement helloworld.GreeterServer.
+type server struct {
+	pb.UnimplementedGreeterServer
 	addr string
 }
 
-func (s *echoServer) UnaryEcho(ctx context.Context, req *pb.EchoRequest) (*pb.EchoResponse, error) {
-	return &pb.EchoResponse{Message: fmt.Sprintf("%s (from %s)", req.Message, s.addr)}, nil
+// SayHello implements helloworld.GreeterServer
+func (s *server) SayHello(_ context.Context, in *pb.HelloRequest) (*pb.HelloReply, error) {
+	return &pb.HelloReply{Message: "Hello " + in.GetName()}, nil
 }
 
 func main() {
@@ -62,12 +67,21 @@ func main() {
 	cleanup := csm.EnableObservability(context.Background(), opentelemetry.Options{MetricsOptions: opentelemetry.MetricsOptions{MeterProvider: provider}})
 	defer cleanup()
 
-	lis, err := net.Listen("tcp", ":"+*port)
+	lis, err := net.Listen("tcp4", "0.0.0.0:"+*port)
 	if err != nil {
 		log.Fatalf("Failed to listen: %v", err)
 	}
-	s := grpc.NewServer()
-	pb.RegisterEchoServer(s, &echoServer{addr: ":" + *port})
+	// Set up xds credentials that fall back to insecure as described in:
+	// https://cloud.google.com/service-mesh/docs/service-routing/security-proxyless-setup#workloads_are_unable_to_communicate_in_the_security_setup.
+	creds, err := xdscreds.NewServerCredentials(xdscreds.ServerOptions{FallbackCreds: insecure.NewCredentials()})
+	if err != nil {
+		log.Fatalf("Failed to create xDS credentials: %v", err)
+	}
+	s, err := xds.NewGRPCServer(grpc.Creds(creds))
+	if err != nil {
+		log.Fatalf("Failed to start xDS Server: %v", err)
+	}
+	pb.RegisterGreeterServer(s, &server{addr: ":" + *port})
 
 	log.Printf("Serving on %s\n", *port)
 

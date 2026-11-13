@@ -51,10 +51,11 @@ func testRoundRobinBasic(ctx context.Context, t *testing.T, opts ...grpc.DialOpt
 
 	const backendCount = 5
 	backends := make([]*stubserver.StubServer, backendCount)
+	endpoints := make([]resolver.Endpoint, backendCount)
 	addrs := make([]resolver.Address, backendCount)
 	for i := 0; i < backendCount; i++ {
 		backend := &stubserver.StubServer{
-			EmptyCallF: func(ctx context.Context, in *testpb.Empty) (*testpb.Empty, error) { return &testpb.Empty{}, nil },
+			EmptyCallF: func(context.Context, *testpb.Empty) (*testpb.Empty, error) { return &testpb.Empty{}, nil },
 		}
 		if err := backend.StartServer(); err != nil {
 			t.Fatalf("Failed to start backend: %v", err)
@@ -64,6 +65,7 @@ func testRoundRobinBasic(ctx context.Context, t *testing.T, opts ...grpc.DialOpt
 
 		backends[i] = backend
 		addrs[i] = resolver.Address{Addr: backend.Address}
+		endpoints[i] = resolver.Endpoint{Addresses: []resolver.Address{addrs[i]}}
 	}
 
 	dopts := []grpc.DialOption{
@@ -115,10 +117,10 @@ func (s) TestRoundRobin_AddressesRemoved(t *testing.T) {
 
 	// Send a resolver update with no addresses. This should push the channel into
 	// TransientFailure.
-	r.UpdateState(resolver.State{Addresses: []resolver.Address{}})
+	r.UpdateState(resolver.State{Endpoints: []resolver.Endpoint{}})
 	testutils.AwaitState(ctx, t, cc, connectivity.TransientFailure)
 
-	const msgWant = "produced zero addresses"
+	const msgWant = "no children to pick from"
 	client := testgrpc.NewTestServiceClient(cc)
 	if _, err := client.EmptyCall(ctx, &testpb.Empty{}); !strings.Contains(status.Convert(err).Message(), msgWant) {
 		t.Fatalf("EmptyCall() = %v, want Contains(Message(), %q)", err, msgWant)
@@ -266,15 +268,14 @@ func (s) TestRoundRobin_UpdateAddressAttributes(t *testing.T) {
 		grpc.WithResolvers(r),
 		grpc.WithDefaultServiceConfig(rrServiceConfig),
 	}
-	cc, err := grpc.Dial(r.Scheme()+":///test.server", dopts...)
+	// Set an initial resolver update with no address attributes.
+	addr := resolver.Address{Addr: backend.Address}
+	r.InitialState(resolver.State{Addresses: []resolver.Address{addr}})
+	cc, err := grpc.NewClient(r.Scheme()+":///test.server", dopts...)
 	if err != nil {
-		t.Fatalf("grpc.Dial() failed: %v", err)
+		t.Fatalf("grpc.NewClient() failed: %v", err)
 	}
 	t.Cleanup(func() { cc.Close() })
-
-	// Send a resolver update with no address attributes.
-	addr := resolver.Address{Addr: backend.Address}
-	r.UpdateState(resolver.State{Addresses: []resolver.Address{addr}})
 
 	// Make an RPC and ensure it does not contain the metadata we are looking for.
 	client := testgrpc.NewTestServiceClient(cc)

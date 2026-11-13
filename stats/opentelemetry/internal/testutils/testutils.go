@@ -18,8 +18,11 @@
 package testutils
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 
@@ -27,6 +30,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata/metricdatatest"
+	"google.golang.org/protobuf/proto"
 )
 
 // Redefine default bounds here to avoid a cyclic dependency with top level
@@ -45,7 +49,7 @@ var (
 //
 // Returns a new gotMetrics map containing the metric data being polled for, or
 // an error if failed to wait for metric.
-func waitForServerCompletedRPCs(ctx context.Context, t *testing.T, reader metric.Reader, wantMetric metricdata.Metrics) (map[string]metricdata.Metrics, error) {
+func waitForServerCompletedRPCs(ctx context.Context, reader metric.Reader, wantMetric metricdata.Metrics) (map[string]metricdata.Metrics, error) {
 	for ; ctx.Err() == nil; <-time.After(time.Millisecond) {
 		rm := &metricdata.ResourceMetrics{}
 		reader.Collect(ctx, rm)
@@ -59,7 +63,16 @@ func waitForServerCompletedRPCs(ctx context.Context, t *testing.T, reader metric
 		if !ok {
 			continue
 		}
-		metricdatatest.AssertEqual(t, wantMetric, val, metricdatatest.IgnoreTimestamp(), metricdatatest.IgnoreExemplars())
+		switch data := val.Data.(type) {
+		case metricdata.Histogram[int64]:
+			if len(wantMetric.Data.(metricdata.Histogram[int64]).DataPoints) > len(data.DataPoints) {
+				continue
+			}
+		case metricdata.Histogram[float64]:
+			if len(wantMetric.Data.(metricdata.Histogram[float64]).DataPoints) > len(data.DataPoints) {
+				continue
+			}
+		}
 		return gotMetrics, nil
 	}
 	return nil, fmt.Errorf("error waiting for metric %v: %v", wantMetric, ctx.Err())
@@ -131,8 +144,8 @@ func createBucketCounts(recordingPoints []float64, bounds []float64) []uint64 {
 			continue
 		}
 		for recordingPoints[recordingPointIndex] <= bound {
-			bucketCount += 1
-			recordingPointIndex += 1
+			bucketCount++
+			recordingPointIndex++
 			if recordingPointIndex >= len(recordingPoints) {
 				break
 			}
@@ -171,7 +184,7 @@ func MetricDataUnary(options MetricDataOptions) []metricdata.Metrics {
 		{
 			Name:        "grpc.client.attempt.started",
 			Description: "Number of client call attempts started.",
-			Unit:        "attempt",
+			Unit:        "{attempt}",
 			Data: metricdata.Sum[int64]{
 				DataPoints: []metricdata.DataPoint[int64]{
 					{
@@ -254,7 +267,7 @@ func MetricDataUnary(options MetricDataOptions) []metricdata.Metrics {
 		{
 			Name:        "grpc.server.call.started",
 			Description: "Number of server calls started.",
-			Unit:        "call",
+			Unit:        "{call}",
 			Data: metricdata.Sum[int64]{
 				DataPoints: []metricdata.DataPoint[int64]{
 					{
@@ -346,7 +359,7 @@ func MetricDataStreaming(options MetricDataOptions) []metricdata.Metrics {
 		{
 			Name:        "grpc.client.attempt.started",
 			Description: "Number of client call attempts started.",
-			Unit:        "attempt",
+			Unit:        "{attempt}",
 			Data: metricdata.Sum[int64]{
 				DataPoints: []metricdata.DataPoint[int64]{
 					{
@@ -429,7 +442,7 @@ func MetricDataStreaming(options MetricDataOptions) []metricdata.Metrics {
 		{
 			Name:        "grpc.server.call.started",
 			Description: "Number of server calls started.",
-			Unit:        "call",
+			Unit:        "{call}",
 			Data: metricdata.Sum[int64]{
 				DataPoints: []metricdata.DataPoint[int64]{
 					{
@@ -545,7 +558,7 @@ func MetricData(options MetricDataOptions) []metricdata.Metrics {
 		{
 			Name:        "grpc.client.attempt.started",
 			Description: "Number of client call attempts started.",
-			Unit:        "attempt",
+			Unit:        "{attempt}",
 			Data: metricdata.Sum[int64]{
 				DataPoints: []metricdata.DataPoint[int64]{
 					{
@@ -660,7 +673,7 @@ func MetricData(options MetricDataOptions) []metricdata.Metrics {
 		{
 			Name:        "grpc.server.call.started",
 			Description: "Number of server calls started.",
-			Unit:        "call",
+			Unit:        "{call}",
 			Data: metricdata.Sum[int64]{
 				DataPoints: []metricdata.DataPoint[int64]{
 					{
@@ -755,19 +768,40 @@ func MetricData(options MetricDataOptions) []metricdata.Metrics {
 	}
 }
 
-// CompareMetrics asserts wantMetrics are what we expect. It polls for eventual
-// server metrics (not emitted synchronously with client side rpc returning),
-// and for duration metrics makes sure the data point is within possible testing
-// time (five seconds from context timeout).
-func CompareMetrics(ctx context.Context, t *testing.T, mr *metric.ManualReader, gotMetrics map[string]metricdata.Metrics, wantMetrics []metricdata.Metrics) {
+// GzipCompressedMessageSize returns the byte length of the proto message after
+// gzip compression.
+func GzipCompressedMessageSize(t *testing.T, m proto.Message) int {
+	t.Helper()
+	data, err := proto.Marshal(m)
+	if err != nil {
+		t.Fatalf("proto.Marshal failed: %v", err)
+	}
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write(data); err != nil {
+		t.Fatalf("gzip.Write failed: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("gzip.Close failed: %v", err)
+	}
+	return buf.Len()
+}
+
+// CompareMetrics asserts wantMetrics are what we expect. For duration metrics
+// makes sure the data point is within possible testing time (five seconds from
+// context timeout).
+func CompareMetrics(t *testing.T, gotMetrics map[string]metricdata.Metrics, wantMetrics []metricdata.Metrics) {
 	for _, metric := range wantMetrics {
+		val, ok := gotMetrics[metric.Name]
+		if !ok {
+			t.Errorf("Metric %v not present in recorded metrics", metric.Name)
+			continue
+		}
+
 		if metric.Name == "grpc.server.call.sent_total_compressed_message_size" || metric.Name == "grpc.server.call.rcvd_total_compressed_message_size" {
-			// Sync the metric reader to see the event because stats.End is
-			// handled async server side. Thus, poll until metrics created from
-			// stats.End show up.
-			var err error
-			if gotMetrics, err = waitForServerCompletedRPCs(ctx, t, mr, metric); err != nil { // move to shared helper
-				t.Fatal(err)
+			val := gotMetrics[metric.Name]
+			if !metricdatatest.AssertEqual(t, metric, val, metricdatatest.IgnoreTimestamp(), metricdatatest.IgnoreExemplars()) {
+				t.Errorf("Metrics data type not equal for metric: %v", metric.Name)
 			}
 			continue
 		}
@@ -775,22 +809,45 @@ func CompareMetrics(ctx context.Context, t *testing.T, mr *metric.ManualReader, 
 		// If one of the duration metrics, ignore the bucket counts, and make
 		// sure it count falls within a bucket <= 5 seconds (maximum duration of
 		// test due to context).
-		val, ok := gotMetrics[metric.Name]
-		if !ok {
-			t.Fatalf("Metric %v not present in recorded metrics", metric.Name)
-		}
 		if metric.Name == "grpc.client.attempt.duration" || metric.Name == "grpc.client.call.duration" || metric.Name == "grpc.server.call.duration" {
+			val := gotMetrics[metric.Name]
 			if !metricdatatest.AssertEqual(t, metric, val, metricdatatest.IgnoreTimestamp(), metricdatatest.IgnoreExemplars(), metricdatatest.IgnoreValue()) {
-				t.Fatalf("Metrics data type not equal for metric: %v", metric.Name)
+				t.Errorf("Metrics data type not equal for metric: %v", metric.Name)
 			}
 			if err := checkDataPointWithinFiveSeconds(val); err != nil {
-				t.Fatalf("Data point not within five seconds for metric %v: %v", metric.Name, err)
+				t.Errorf("Data point not within five seconds for metric %v: %v", metric.Name, err)
 			}
 			continue
 		}
 
 		if !metricdatatest.AssertEqual(t, metric, val, metricdatatest.IgnoreTimestamp(), metricdatatest.IgnoreExemplars()) {
-			t.Fatalf("Metrics data type not equal for metric: %v", metric.Name)
+			t.Errorf("Metrics data type not equal for metric: %v", metric.Name)
 		}
 	}
+}
+
+// WaitForServerMetrics waits for eventual server metrics (not emitted
+// synchronously with client side rpc returning).
+func WaitForServerMetrics(ctx context.Context, t *testing.T, mr *metric.ManualReader, gotMetrics map[string]metricdata.Metrics, wantMetrics []metricdata.Metrics) map[string]metricdata.Metrics {
+	terminalMetrics := []string{
+		"grpc.server.call.sent_total_compressed_message_size",
+		"grpc.server.call.rcvd_total_compressed_message_size",
+		"grpc.client.attempt.duration",
+		"grpc.client.call.duration",
+		"grpc.server.call.duration",
+	}
+	for _, metric := range wantMetrics {
+		if !slices.Contains(terminalMetrics, metric.Name) {
+			continue
+		}
+		// Sync the metric reader to see the event because stats.End is
+		// handled async server side. Thus, poll until metrics created from
+		// stats.End show up.
+		var err error
+		if gotMetrics, err = waitForServerCompletedRPCs(ctx, mr, metric); err != nil { // move to shared helper
+			t.Fatal(err)
+		}
+	}
+
+	return gotMetrics
 }

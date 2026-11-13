@@ -28,11 +28,11 @@ import (
 	_ "google.golang.org/grpc/balancer/leastrequest"       // To register least_request
 	_ "google.golang.org/grpc/balancer/weightedroundrobin" // To register weighted_round_robin
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/internal/envconfig"
 	"google.golang.org/grpc/internal/stubserver"
 	"google.golang.org/grpc/internal/testutils"
 	"google.golang.org/grpc/internal/testutils/roundrobin"
 	"google.golang.org/grpc/internal/testutils/xds/e2e"
+	"google.golang.org/grpc/internal/testutils/xds/e2e/setup"
 	"google.golang.org/grpc/resolver"
 
 	v3xdsxdstypepb "github.com/cncf/xds/go/xds/type/v3"
@@ -93,12 +93,6 @@ func clusterWithLBConfiguration(t *testing.T, clusterName, edsServiceName string
 // first) child load balancing policy, and asserts the correct distribution
 // based on the locality weights and the endpoint picking policy specified.
 func (s) TestWrrLocality(t *testing.T) {
-	oldLeastRequestLBSupport := envconfig.LeastRequestLB
-	envconfig.LeastRequestLB = true
-	defer func() {
-		envconfig.LeastRequestLB = oldLeastRequestLBSupport
-	}()
-
 	backend1 := stubserver.StartTestService(t, nil)
 	port1 := testutils.ParsePort(t, backend1.Address)
 	defer backend1.Stop()
@@ -222,7 +216,7 @@ func (s) TestWrrLocality(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			// Start an xDS management server.
-			managementServer, nodeID, _, xdsResolver := setupManagementServerAndResolver(t)
+			managementServer, nodeID, _, xdsResolver := setup.ManagementServerAndResolver(t)
 
 			routeConfigName := "route-" + serviceName
 			clusterName := "cluster-" + serviceName
@@ -237,11 +231,11 @@ func (s) TestWrrLocality(t *testing.T) {
 					Host:        "localhost",
 					Localities: []e2e.LocalityOptions{
 						{
-							Backends: []e2e.BackendOptions{{Port: port1}, {Port: port2}},
+							Backends: []e2e.BackendOptions{{Ports: []uint32{port1}}, {Ports: []uint32{port2}}},
 							Weight:   1,
 						},
 						{
-							Backends: []e2e.BackendOptions{{Port: port3}, {Port: port4}, {Port: port5}},
+							Backends: []e2e.BackendOptions{{Ports: []uint32{port3}}, {Ports: []uint32{port4}}, {Ports: []uint32{port5}}},
 							Weight:   2,
 						},
 					},
@@ -267,7 +261,7 @@ func (s) TestWrrLocality(t *testing.T) {
 					addrDistWant = append(addrDistWant, resolver.Address{Addr: addrAndCount.addr})
 				}
 			}
-			if err := roundrobin.CheckWeightedRoundRobinRPCs(ctx, client, addrDistWant); err != nil {
+			if err := roundrobin.CheckWeightedRoundRobinRPCs(ctx, t, client, addrDistWant); err != nil {
 				t.Fatalf("Error in expected round robin: %v", err)
 			}
 		})

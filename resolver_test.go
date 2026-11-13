@@ -55,7 +55,7 @@ func (s) TestResolverCaseSensitivity(t *testing.T) {
 	// into a loopback IP (v4 or v6) address.
 	target := "caseTest:///localhost:1234"
 	addrCh := make(chan string, 1)
-	customDialer := func(ctx context.Context, addr string) (net.Conn, error) {
+	customDialer := func(_ context.Context, addr string) (net.Conn, error) {
 		select {
 		case addrCh <- addr:
 		default:
@@ -63,9 +63,9 @@ func (s) TestResolverCaseSensitivity(t *testing.T) {
 		return nil, fmt.Errorf("not dialing with custom dialer")
 	}
 
-	cc, err := Dial(target, WithContextDialer(customDialer), WithTransportCredentials(insecure.NewCredentials()))
+	cc, err := NewClient(target, WithContextDialer(customDialer), WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		t.Fatalf("Unexpected Dial(%q) error: %v", target, err)
+		t.Fatalf("Unexpected NewClient(%q) error: %v", target, err)
 	}
 	cc.Connect()
 	if got, want := <-addrCh, "localhost:1234"; got != want {
@@ -85,9 +85,9 @@ func (s) TestResolverCaseSensitivity(t *testing.T) {
 	// This results in "passthrough" being used with the address as the whole
 	// target.
 	target = "caseTest2:///localhost:1234"
-	cc, err = Dial(target, WithContextDialer(customDialer), WithResolvers(res), WithTransportCredentials(insecure.NewCredentials()))
+	cc, err = NewClient(target, WithContextDialer(customDialer), withDefaultScheme("passthrough"), WithResolvers(res), WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		t.Fatalf("Unexpected Dial(%q) error: %v", target, err)
+		t.Fatalf("Unexpected NewClient(%q) error: %v", target, err)
 	}
 	cc.Connect()
 	if got, want := <-addrCh, target; got != want {
@@ -120,13 +120,14 @@ func (s) TestResolverAddressesToEndpoints(t *testing.T) {
 	a2 := attributes.New("a", "b")
 	r.InitialState(resolver.State{Addresses: []resolver.Address{{Addr: "addr1", BalancerAttributes: a1}, {Addr: "addr2", BalancerAttributes: a2}}})
 
-	cc, err := Dial(r.Scheme()+":///",
+	cc, err := NewClient(r.Scheme()+":///",
 		WithTransportCredentials(insecure.NewCredentials()),
 		WithResolvers(r),
 		WithDefaultServiceConfig(fmt.Sprintf(`{"loadBalancingConfig": [{"%s":{}}]}`, balancerName)))
 	if err != nil {
-		t.Fatalf("Unexpected error dialing: %v", err)
+		t.Fatalf("NewClient() failed: %v", err)
 	}
+	cc.Connect()
 	defer cc.Close()
 
 	select {
@@ -143,22 +144,54 @@ func (s) TestResolverAddressesToEndpoints(t *testing.T) {
 	}
 }
 
-// Test ensures that there is no panic if the attributes within
-// resolver.State.Addresses contains a typed-nil value.
-func (s) TestResolverAddressesWithTypedNilAttribute(t *testing.T) {
-	r := manual.NewBuilderWithScheme(t.Name())
-	resolver.Register(r)
+// Test ensures one Endpoint is created for each entry in
+// resolver.State.Addresses automatically. The test calls the deprecated
+// NewAddresses API to send a list of addresses to the channel.
+func (s) TestResolverAddressesToEndpointsUsingNewAddresses(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
 
-	addrAttr := attributes.New("typed_nil", (*stringerVal)(nil))
-	r.InitialState(resolver.State{Addresses: []resolver.Address{{Addr: "addr1", Attributes: addrAttr}}})
+	const scheme = "testresolveraddressestoendpoints"
+	r := manual.NewBuilderWithScheme(scheme)
 
-	cc, err := Dial(r.Scheme()+":///", WithTransportCredentials(insecure.NewCredentials()), WithResolvers(r))
-	if err != nil {
-		t.Fatalf("Unexpected error dialing: %v", err)
+	stateCh := make(chan balancer.ClientConnState, 1)
+	bf := stub.BalancerFuncs{
+		UpdateClientConnState: func(_ *stub.BalancerData, ccs balancer.ClientConnState) error {
+			stateCh <- ccs
+			return nil
+		},
 	}
+	balancerName := "stub-balancer-" + scheme
+	stub.Register(balancerName, bf)
+
+	a1 := attributes.New("x", "y")
+	a2 := attributes.New("a", "b")
+	addrs := []resolver.Address{
+		{Addr: "addr1", BalancerAttributes: a1},
+		{Addr: "addr2", BalancerAttributes: a2},
+	}
+
+	cc, err := NewClient(r.Scheme()+":///",
+		WithTransportCredentials(insecure.NewCredentials()),
+		WithResolvers(r),
+		WithDefaultServiceConfig(fmt.Sprintf(`{"loadBalancingConfig": [{"%s":{}}]}`, balancerName)))
+	if err != nil {
+		t.Fatalf("NewClient() failed: %v", err)
+	}
+	cc.Connect()
 	defer cc.Close()
+	r.CC().NewAddress(addrs)
+
+	select {
+	case got := <-stateCh:
+		want := []resolver.Endpoint{
+			{Addresses: []resolver.Address{{Addr: "addr1"}}, Attributes: a1},
+			{Addresses: []resolver.Address{{Addr: "addr2"}}, Attributes: a2},
+		}
+		if diff := cmp.Diff(got.ResolverState.Endpoints, want); diff != "" {
+			t.Errorf("Did not receive expected endpoints.  Diff (-got +want):\n%v", diff)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for endpoints")
+	}
 }
-
-type stringerVal struct{ s string }
-
-func (s stringerVal) String() string { return s.s }

@@ -43,7 +43,7 @@ import (
 	v1reflectionpb "google.golang.org/grpc/reflection/grpc_reflection_v1"
 	v1alphareflectiongrpc "google.golang.org/grpc/reflection/grpc_reflection_v1alpha"
 	pb "google.golang.org/grpc/reflection/grpc_testing"
-	pbv3 "google.golang.org/grpc/reflection/test/grpc_testing_not_regenerate"
+	pbv3 "google.golang.org/grpc/testdata/grpc_testing_not_regenerated"
 )
 
 var (
@@ -377,21 +377,21 @@ type server struct {
 	pb.UnimplementedSearchServiceServer
 }
 
-func (s *server) Search(ctx context.Context, in *pb.SearchRequest) (*pb.SearchResponse, error) {
+func (s *server) Search(context.Context, *pb.SearchRequest) (*pb.SearchResponse, error) {
 	return &pb.SearchResponse{}, nil
 }
 
-func (s *server) StreamingSearch(stream pb.SearchService_StreamingSearchServer) error {
+func (s *server) StreamingSearch(pb.SearchService_StreamingSearchServer) error {
 	return nil
 }
 
 type serverV3 struct{}
 
-func (s *serverV3) Search(ctx context.Context, in *pbv3.SearchRequestV3) (*pbv3.SearchResponseV3, error) {
+func (s *serverV3) Search(context.Context, *pbv3.SearchRequestV3) (*pbv3.SearchResponseV3, error) {
 	return &pbv3.SearchResponseV3{}, nil
 }
 
-func (s *serverV3) StreamingSearch(stream pbv3.SearchServiceV3_StreamingSearchServer) error {
+func (s *serverV3) StreamingSearch(pbv3.SearchServiceV3_StreamingSearchServer) error {
 	return nil
 }
 
@@ -605,9 +605,9 @@ func testFileContainingSymbol(t *testing.T, stream v1reflectiongrpc.ServerReflec
 
 func testFileContainingSymbolError(t *testing.T, stream v1reflectiongrpc.ServerReflection_ServerReflectionInfoClient) {
 	for _, test := range []string{
-		"grpc.testing.SerchService",
+		"grpc.testing.SearchService_",
 		"grpc.testing.SearchService.SearchE",
-		"grpc.tesing.SearchResponse",
+		"grpc.testing_.SearchResponse",
 		"gpc.testing.ToBeExtended",
 	} {
 		if err := stream.Send(&v1reflectionpb.ServerReflectionRequest{

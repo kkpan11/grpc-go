@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/http/httputil"
 	"strings"
 	"testing"
@@ -35,7 +36,6 @@ import (
 	"github.com/google/go-cmp/cmp"
 
 	"google.golang.org/grpc/credentials"
-	icredentials "google.golang.org/grpc/internal/credentials"
 	"google.golang.org/grpc/internal/grpctest"
 	"google.golang.org/grpc/internal/testutils"
 )
@@ -102,14 +102,14 @@ func createTestContext(ctx context.Context, s credentials.SecurityLevel) context
 		Method:   "testInfo",
 		AuthInfo: auth,
 	}
-	return icredentials.NewRequestInfoContext(ctx, ri)
+	return credentials.NewContextWithRequestInfo(ctx, ri)
 }
 
 // errReader implements the io.Reader interface and returns an error from the
 // Read method.
 type errReader struct{}
 
-func (r errReader) Read(b []byte) (n int, err error) {
+func (r errReader) Read([]byte) (n int, err error) {
 	return 0, errors.New("read error")
 }
 
@@ -155,7 +155,7 @@ func overrideHTTPClient(fc *testutils.FakeHTTPClient) func() {
 // our tests.
 func overrideSubjectTokenGood() func() {
 	origReadSubjectTokenFrom := readSubjectTokenFrom
-	readSubjectTokenFrom = func(path string) ([]byte, error) {
+	readSubjectTokenFrom = func(string) ([]byte, error) {
 		return []byte(subjectTokenContents), nil
 	}
 	return func() { readSubjectTokenFrom = origReadSubjectTokenFrom }
@@ -164,7 +164,7 @@ func overrideSubjectTokenGood() func() {
 // Overrides the subject token read to always return an error.
 func overrideSubjectTokenError() func() {
 	origReadSubjectTokenFrom := readSubjectTokenFrom
-	readSubjectTokenFrom = func(path string) ([]byte, error) {
+	readSubjectTokenFrom = func(string) ([]byte, error) {
 		return nil, errors.New("error reading subject token")
 	}
 	return func() { readSubjectTokenFrom = origReadSubjectTokenFrom }
@@ -174,7 +174,7 @@ func overrideSubjectTokenError() func() {
 // our tests.
 func overrideActorTokenGood() func() {
 	origReadActorTokenFrom := readActorTokenFrom
-	readActorTokenFrom = func(path string) ([]byte, error) {
+	readActorTokenFrom = func(string) ([]byte, error) {
 		return []byte(actorTokenContents), nil
 	}
 	return func() { readActorTokenFrom = origReadActorTokenFrom }
@@ -183,7 +183,7 @@ func overrideActorTokenGood() func() {
 // Overrides the actor token read to always return an error.
 func overrideActorTokenError() func() {
 	origReadActorTokenFrom := readActorTokenFrom
-	readActorTokenFrom = func(path string) ([]byte, error) {
+	readActorTokenFrom = func(string) ([]byte, error) {
 		return nil, errors.New("error reading actor token")
 	}
 	return func() { readActorTokenFrom = origReadActorTokenFrom }
@@ -701,6 +701,42 @@ func (s) TestSendRequest(t *testing.T) {
 				t.Errorf("sendRequest(%v) = %v, wantErr: %v", req, err, test.wantErr)
 			}
 		})
+	}
+}
+
+func (s) TestSendRequestDoesNotFollowRedirects(t *testing.T) {
+	// Stands in for a redirect target that must never receive the token
+	// exchange request. It records the body of any request it does get.
+	leaked := make(chan string, 1)
+	redirectTarget := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		select {
+		case leaked <- string(body):
+		default:
+		}
+	}))
+	defer redirectTarget.Close()
+
+	// The configured token exchange endpoint redirects the POST, whose body
+	// carries the subject token, to another host.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, redirectTarget.URL, http.StatusTemporaryRedirect)
+	}))
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodPost, server.URL, bytes.NewBufferString(`{"subject_token":"secret"}`))
+	if err != nil {
+		t.Fatalf("http.NewRequest() failed: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	if _, err := sendRequest(makeHTTPClient(nil), req); err == nil {
+		t.Error("sendRequest() succeeded across a redirect; want a non-nil error")
+	}
+	select {
+	case body := <-leaked:
+		t.Errorf("Redirect target received request body %q; the subject token must not be replayed to another host", body)
+	default:
 	}
 }
 

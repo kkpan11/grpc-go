@@ -21,27 +21,179 @@ package grpc
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
+	"errors"
 	"io"
 	"math"
 	"reflect"
+	"sync"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/encoding"
+	_ "google.golang.org/grpc/encoding/gzip"
 	protoenc "google.golang.org/grpc/encoding/proto"
 	"google.golang.org/grpc/internal/testutils"
 	"google.golang.org/grpc/internal/transport"
+	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/status"
 	perfpb "google.golang.org/grpc/test/codec_perf"
 	"google.golang.org/protobuf/proto"
 )
 
-type fullReader struct {
-	reader io.Reader
+const (
+	defaultDecompressedData = "default decompressed data"
+	decompressionErrorMsg   = "invalid compression format"
+)
+
+type testCompressorForRegistry struct {
+	name string
 }
 
-func (f fullReader) Read(p []byte) (int, error) {
-	return io.ReadFull(f.reader, p)
+func (c *testCompressorForRegistry) Compress(w io.Writer) (io.WriteCloser, error) {
+	return &testWriteCloser{w}, nil
+}
+
+func (c *testCompressorForRegistry) Decompress(r io.Reader) (io.Reader, error) {
+	return r, nil
+}
+
+func (c *testCompressorForRegistry) Name() string {
+	return c.name
+}
+
+type testWriteCloser struct {
+	io.Writer
+}
+
+func (w *testWriteCloser) Close() error {
+	return nil
+}
+
+func (s) TestNewAcceptedCompressionConfig(t *testing.T) {
+	// Register a test compressor for multi-compressor tests
+	testCompressor := &testCompressorForRegistry{name: "test-compressor"}
+	encoding.RegisterCompressor(testCompressor)
+	defer func() {
+		// Unregister the test compressor
+		encoding.RegisterCompressor(&testCompressorForRegistry{name: "test-compressor"})
+	}()
+
+	tests := []struct {
+		name        string
+		input       []string
+		wantAllowed []string
+		wantErr     bool
+	}{
+		{
+			name:        "identity-only",
+			input:       nil,
+			wantAllowed: nil,
+		},
+		{
+			name:        "single valid",
+			input:       []string{"gzip"},
+			wantAllowed: []string{"gzip"},
+		},
+		{
+			name:        "dedupe and trim",
+			input:       []string{" gzip ", "gzip"},
+			wantAllowed: []string{"gzip"},
+		},
+		{
+			name:        "ignores identity",
+			input:       []string{"identity", "gzip"},
+			wantAllowed: []string{"gzip"},
+		},
+		{
+			name:        "explicit identity only",
+			input:       []string{"identity"},
+			wantAllowed: nil,
+		},
+		{
+			name:    "invalid compressor",
+			input:   []string{"does-not-exist"},
+			wantErr: true,
+		},
+		{
+			name:        "only whitespace",
+			input:       []string{"   ", "\t"},
+			wantAllowed: nil,
+		},
+		{
+			name:        "multiple valid compressors",
+			input:       []string{"gzip", "test-compressor"},
+			wantAllowed: []string{"gzip", "test-compressor"},
+		},
+		{
+			name:        "multiple with identity and whitespace",
+			input:       []string{"gzip", "identity", " test-compressor ", "  "},
+			wantAllowed: []string{"gzip", "test-compressor"},
+		},
+		{
+			name:        "empty string in list",
+			input:       []string{"gzip", "", "test-compressor"},
+			wantAllowed: []string{"gzip", "test-compressor"},
+		},
+		{
+			name:    "mixed valid and invalid",
+			input:   []string{"gzip", "invalid-comp"},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			allowed, err := newAcceptedCompressionConfig(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("newAcceptedCompressionConfig(%v) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+			}
+			if tt.wantErr {
+				return
+			}
+			if diff := cmp.Diff(tt.wantAllowed, allowed); diff != "" {
+				t.Fatalf("allowed diff (-want +got): %v", diff)
+			}
+		})
+	}
+}
+
+type fullReader struct {
+	data []byte
+}
+
+func (f *fullReader) ReadMessageHeader(header []byte) error {
+	buf, err := f.Read(len(header))
+	defer buf.Free()
+	if err != nil {
+		return err
+	}
+
+	buf.CopyTo(header)
+	return nil
+}
+
+func (f *fullReader) Read(n int) (mem.BufferSlice, error) {
+	if n == 0 {
+		return nil, nil
+	}
+
+	if len(f.data) == 0 {
+		return nil, io.EOF
+	}
+
+	if len(f.data) < n {
+		data := f.data
+		f.data = nil
+		return mem.BufferSlice{mem.SliceBuffer(data)}, io.ErrUnexpectedEOF
+	}
+
+	buf := f.data[:n]
+	f.data = f.data[n:]
+
+	return mem.BufferSlice{mem.SliceBuffer(buf)}, nil
 }
 
 var _ CallOption = EmptyCallOption{} // ensure EmptyCallOption implements the interface
@@ -64,10 +216,10 @@ func (s) TestSimpleParsing(t *testing.T) {
 		// Check that messages with length >= 2^24 are parsed.
 		{append([]byte{0, 1, 0, 0, 0}, bigMsg...), nil, bigMsg, compressionNone},
 	} {
-		buf := fullReader{bytes.NewReader(test.p)}
-		parser := &parser{r: buf, recvBufferPool: nopBufferPool{}}
+		buf := &fullReader{test.p}
+		parser := &parser{r: buf, bufferPool: mem.DefaultBufferPool()}
 		pt, b, err := parser.recvMsg(math.MaxInt32)
-		if err != test.err || !bytes.Equal(b, test.b) || pt != test.pt {
+		if err != test.err || !bytes.Equal(b.Materialize(), test.b) || pt != test.pt {
 			t.Fatalf("parser{%v}.recvMsg(_) = %v, %v, %v\nwant %v, %v, %v", test.p, pt, b, err, test.pt, test.b, test.err)
 		}
 	}
@@ -76,8 +228,8 @@ func (s) TestSimpleParsing(t *testing.T) {
 func (s) TestMultipleParsing(t *testing.T) {
 	// Set a byte stream consists of 3 messages with their headers.
 	p := []byte{0, 0, 0, 0, 1, 'a', 0, 0, 0, 0, 2, 'b', 'c', 0, 0, 0, 0, 1, 'd'}
-	b := fullReader{bytes.NewReader(p)}
-	parser := &parser{r: b, recvBufferPool: nopBufferPool{}}
+	b := &fullReader{p}
+	parser := &parser{r: b, bufferPool: mem.DefaultBufferPool()}
 
 	wantRecvs := []struct {
 		pt   payloadFormat
@@ -89,7 +241,7 @@ func (s) TestMultipleParsing(t *testing.T) {
 	}
 	for i, want := range wantRecvs {
 		pt, data, err := parser.recvMsg(math.MaxInt32)
-		if err != nil || pt != want.pt || !reflect.DeepEqual(data, want.data) {
+		if err != nil || pt != want.pt || !reflect.DeepEqual(data.Materialize(), want.data) {
 			t.Fatalf("after %d calls, parser{%v}.recvMsg(_) = %v, %v, %v\nwant %v, %v, <nil>",
 				i, p, pt, data, err, want.pt, want.data)
 		}
@@ -113,12 +265,12 @@ func (s) TestEncode(t *testing.T) {
 	}{
 		{nil, []byte{0, 0, 0, 0, 0}, []byte{}, nil},
 	} {
-		data, err := encode(encoding.GetCodec(protoenc.Name), test.msg)
-		if err != test.err || !bytes.Equal(data, test.data) {
+		data, err := encode(getCodec(protoenc.Name), test.msg)
+		if err != test.err || !bytes.Equal(data.Materialize(), test.data) {
 			t.Errorf("encode(_, %v) = %v, %v; want %v, %v", test.msg, data, err, test.data, test.err)
 			continue
 		}
-		if hdr, _ := msgHeader(data, nil); !bytes.Equal(hdr, test.hdr) {
+		if hdr, _ := msgHeader(data, nil, compressionNone); !bytes.Equal(hdr, test.hdr) {
 			t.Errorf("msgHeader(%v, false) = %v; want %v", data, hdr, test.hdr)
 		}
 	}
@@ -194,7 +346,7 @@ func (s) TestToRPCErr(t *testing.T) {
 // bmEncode benchmarks encoding a Protocol Buffer message containing mSize
 // bytes.
 func bmEncode(b *testing.B, mSize int) {
-	cdc := encoding.GetCodec(protoenc.Name)
+	cdc := getCodec(protoenc.Name)
 	msg := &perfpb.Buffer{Body: make([]byte, mSize)}
 	encodeData, _ := encode(cdc, msg)
 	encodedSz := int64(len(encodeData))
@@ -265,4 +417,260 @@ func BenchmarkGZIPCompressor512KiB(b *testing.B) {
 
 func BenchmarkGZIPCompressor1MiB(b *testing.B) {
 	bmCompressor(b, 1024*1024, NewGZIPCompressor())
+}
+
+// mustCompress gzip-compresses input and returns it as a BufferSlice,
+// failing the test if compression fails.
+func mustCompress(t *testing.T, input []byte) mem.BufferSlice {
+	t.Helper()
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	if _, err := gz.Write(input); err != nil {
+		t.Fatalf("mustCompress() failed to write data: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("mustCompress() failed to close gzip writer: %v", err)
+	}
+	compressedData := buf.Bytes()
+	return mem.BufferSlice{mem.NewBuffer(&compressedData, nil)}
+}
+
+// MockDecompressor is a mock implementation of a decompressor used for testing purposes.
+// It simulates decompression behavior, returning either decompressed data or an error based on the ShouldError flag.
+type MockDecompressor struct {
+	ShouldError bool // Flag to control whether the decompression should simulate an error.
+}
+
+// Do simulates decompression. It returns a predefined error if ShouldError is true,
+// or a fixed set of decompressed data if ShouldError is false.
+func (m *MockDecompressor) Do(_ io.Reader) ([]byte, error) {
+	if m.ShouldError {
+		return nil, errors.New(decompressionErrorMsg)
+	}
+	return []byte(defaultDecompressedData), nil
+}
+
+// Type returns the string identifier for the MockDecompressor.
+func (m *MockDecompressor) Type() string {
+	return "MockDecompressor"
+}
+
+// TestDecompress tests the decompress function behaves correctly for following scenarios
+// decompress successfully when message is <= maxReceiveMessageSize
+// errors when message > maxReceiveMessageSize
+// decompress successfully when maxReceiveMessageSize is MaxInt
+// errors when the decompressed message has an invalid format
+// errors when the decompressed message exceeds the maxReceiveMessageSize.
+func (s) TestDecompress(t *testing.T) {
+	compressor := encoding.GetCompressor("gzip")
+	validDecompressor := &MockDecompressor{ShouldError: false}
+	invalidFormatDecompressor := &MockDecompressor{ShouldError: true}
+
+	testCases := []struct {
+		name                  string
+		input                 mem.BufferSlice
+		dc                    Decompressor
+		maxReceiveMessageSize int
+		want                  []byte
+		wantErr               error
+	}{
+		{
+			name:                  "Decompresses successfully with sufficient buffer size",
+			input:                 mustCompress(t, []byte("decompressed data")),
+			dc:                    nil,
+			maxReceiveMessageSize: 50,
+			want:                  []byte("decompressed data"),
+			wantErr:               nil,
+		},
+		{
+			name:                  "Fails due to exceeding maxReceiveMessageSize",
+			input:                 mustCompress(t, []byte("message that is too large")),
+			dc:                    nil,
+			maxReceiveMessageSize: len("message that is too large") - 1,
+			want:                  nil,
+			wantErr:               status.Errorf(codes.ResourceExhausted, "grpc: received message after decompression larger than max %d", len("message that is too large")-1),
+		},
+		{
+			name:                  "Decompresses to exactly maxReceiveMessageSize",
+			input:                 mustCompress(t, []byte("exact size message")),
+			dc:                    nil,
+			maxReceiveMessageSize: len("exact size message"),
+			want:                  []byte("exact size message"),
+			wantErr:               nil,
+		},
+		{
+			name:                  "Decompresses successfully with maxReceiveMessageSize MaxInt",
+			input:                 mustCompress(t, []byte("large message")),
+			dc:                    nil,
+			maxReceiveMessageSize: math.MaxInt,
+			want:                  []byte("large message"),
+			wantErr:               nil,
+		},
+		{
+			name:                  "Fails with decompression error due to invalid format",
+			input:                 mustCompress(t, []byte("invalid compressed data")),
+			dc:                    invalidFormatDecompressor,
+			maxReceiveMessageSize: 50,
+			want:                  nil,
+			wantErr:               status.Errorf(codes.Internal, "grpc: failed to decompress the received message: %v", errors.New(decompressionErrorMsg)),
+		},
+		{
+			name:                  "Fails with resourceExhausted error when decompressed message exceeds maxReceiveMessageSize",
+			input:                 mustCompress(t, []byte("large compressed data")),
+			dc:                    validDecompressor,
+			maxReceiveMessageSize: 20,
+			want:                  nil,
+			wantErr:               status.Errorf(codes.ResourceExhausted, "grpc: message after decompression larger than max (%d vs. %d)", 25, 20),
+		},
+		{
+			// Bombs the legacy gzipDecompressor with 1 MiB of zeros (which
+			// gzips down to a few KiB). doWithMaxSize must cap the read at
+			// maxRecv+1 bytes; the error reports exactly that size so we
+			// know only maxRecv+1 bytes were materialised.
+			name:                  "Legacy gzipDecompressor bounds decompressed bomb to maxReceiveMessageSize+1",
+			input:                 mustCompress(t, make([]byte, 1<<20)),
+			dc:                    NewGZIPDecompressor(),
+			maxReceiveMessageSize: 1024,
+			want:                  nil,
+			wantErr:               status.Errorf(codes.ResourceExhausted, "grpc: message after decompression larger than max (%d vs. %d)", 1025, 1024),
+		},
+		{
+			name:                  "Legacy gzipDecompressor decompresses successfully when payload fits",
+			input:                 mustCompress(t, []byte("hello legacy decompressor")),
+			dc:                    NewGZIPDecompressor(),
+			maxReceiveMessageSize: len("hello legacy decompressor"),
+			want:                  []byte("hello legacy decompressor"),
+			wantErr:               nil,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			output, err := decompress(compressor, tc.input, tc.dc, tc.maxReceiveMessageSize, mem.DefaultBufferPool())
+			if !cmp.Equal(err, tc.wantErr, cmpopts.EquateErrors()) {
+				t.Fatalf("decompress() err = %v, wantErr = %v", err, tc.wantErr)
+			}
+			if !cmp.Equal(tc.want, output.Materialize()) {
+				t.Fatalf("decompress() output mismatch: got = %v, want = %v", output.Materialize(), tc.want)
+			}
+		})
+	}
+}
+
+type mockCompressor struct {
+	// Written to by the io.Reader on every call to Read.
+	ch chan<- struct{}
+}
+
+func (m *mockCompressor) Compress(io.Writer) (io.WriteCloser, error) {
+	panic("unimplemented")
+}
+
+func (m *mockCompressor) Decompress(io.Reader) (io.Reader, error) {
+	return m, nil
+}
+
+func (m *mockCompressor) Read([]byte) (int, error) {
+	m.ch <- struct{}{}
+	return 1, io.EOF
+}
+
+func (m *mockCompressor) Name() string { return "" }
+
+// Tests that the decompressor's Read method is not called after it returns EOF.
+func (s) TestDecompress_NoReadAfterEOF(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+
+	ch := make(chan struct{}, 10)
+	mc := &mockCompressor{ch: ch}
+	in := mem.BufferSlice{mem.NewBuffer(&[]byte{1, 2, 3}, nil)}
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		out, err := decompress(mc, in, nil, 1, mem.DefaultBufferPool())
+		if err != nil {
+			t.Errorf("Unexpected error from decompress: %v", err)
+			return
+		}
+		out.Free()
+	}()
+	select {
+	case <-ch:
+	case <-ctx.Done():
+		t.Fatalf("Timed out waiting for call to compressor")
+	}
+	ctx, cancel = context.WithTimeout(ctx, defaultTestShortTimeout)
+	defer cancel()
+	select {
+	case <-ch:
+		t.Fatalf("Unexpected second compressor.Read call detected")
+	case <-ctx.Done():
+	}
+	wg.Wait()
+}
+
+type fakeCloseCompressor struct {
+	encoding.Compressor
+	io.Reader
+	ch chan<- struct{}
+}
+
+func (m *fakeCloseCompressor) Decompress(r io.Reader) (io.Reader, error) {
+	zr, err := gzip.NewReader(r)
+	if err != nil {
+		return nil, err
+	}
+	m.Reader = zr
+	return m, nil
+}
+
+func (m *fakeCloseCompressor) Close() error {
+	close(m.ch)
+	return nil
+}
+
+// TestDecompress_ClosesReader tests that the reader returned by Decompress is
+// closed when decompress returns.
+func (s) TestDecompress_ClosesReader(t *testing.T) {
+	testCases := []struct {
+		name                  string
+		maxReceiveMessageSize int
+		wantCode              codes.Code
+	}{
+		{
+			name:                  "close_on_failure",
+			maxReceiveMessageSize: 1,
+			wantCode:              codes.ResourceExhausted,
+		},
+		{
+			name:                  "close_on_success",
+			maxReceiveMessageSize: 100,
+			wantCode:              codes.OK,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+			defer cancel()
+
+			ch := make(chan struct{})
+			compressor := &fakeCloseCompressor{ch: ch}
+			in := mustCompress(t, []byte("some data"))
+			out, err := decompress(compressor, in, nil, tc.maxReceiveMessageSize, mem.DefaultBufferPool())
+			if status.Code(err) != tc.wantCode {
+				t.Fatalf("decompress() failed with error code %v, want %v", status.Code(err), tc.wantCode)
+			}
+
+			out.Free()
+
+			select {
+			case <-ch:
+			case <-ctx.Done():
+				t.Fatalf("Timed out waiting for Close to be called")
+			}
+		})
+	}
 }

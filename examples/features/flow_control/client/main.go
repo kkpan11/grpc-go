@@ -16,7 +16,8 @@
  *
  */
 
-// Binary client is an example client.
+// Binary client demonstrates how the gRPC flow control blocks sending when the
+// receiver is not ready.
 package main
 
 import (
@@ -34,7 +35,7 @@ import (
 
 var addr = flag.String("addr", "localhost:50052", "the address to connect to")
 
-var payload string = string(make([]byte, 8*1024)) // 8KB
+var payload = string(make([]byte, 8*1024)) // 8KB
 
 func main() {
 	flag.Parse()

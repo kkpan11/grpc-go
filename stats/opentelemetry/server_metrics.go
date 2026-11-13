@@ -21,23 +21,23 @@ import (
 	"sync/atomic"
 	"time"
 
+	otelattribute "go.opentelemetry.io/otel/attribute"
+	otelmetric "go.opentelemetry.io/otel/metric"
+
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/internal"
+	estats "google.golang.org/grpc/experimental/stats"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
-
-	otelattribute "go.opentelemetry.io/otel/attribute"
-	otelmetric "go.opentelemetry.io/otel/metric"
 )
 
-type serverStatsHandler struct {
-	options Options
-
+type serverMetricsHandler struct {
+	estats.MetricsRecorder
+	options       Options
 	serverMetrics serverMetrics
 }
 
-func (h *serverStatsHandler) initializeMetrics() {
+func (h *serverMetricsHandler) initializeMetrics() {
 	// Will set no metrics to record, logically making this stats handler a
 	// no-op.
 	if h.options.MetricsOptions.MeterProvider == nil {
@@ -50,13 +50,19 @@ func (h *serverStatsHandler) initializeMetrics() {
 	}
 	metrics := h.options.MetricsOptions.Metrics
 	if metrics == nil {
-		metrics = DefaultMetrics
+		metrics = DefaultMetrics()
 	}
 
-	h.serverMetrics.callStarted = createInt64Counter(metrics.metrics, "grpc.server.call.started", meter, otelmetric.WithUnit("call"), otelmetric.WithDescription("Number of server calls started."))
-	h.serverMetrics.callSentTotalCompressedMessageSize = createInt64Histogram(metrics.metrics, "grpc.server.call.sent_total_compressed_message_size", meter, otelmetric.WithUnit("By"), otelmetric.WithDescription("Compressed message bytes sent per server call."), otelmetric.WithExplicitBucketBoundaries(DefaultSizeBounds...))
-	h.serverMetrics.callRcvdTotalCompressedMessageSize = createInt64Histogram(metrics.metrics, "grpc.server.call.rcvd_total_compressed_message_size", meter, otelmetric.WithUnit("By"), otelmetric.WithDescription("Compressed message bytes received per server call."), otelmetric.WithExplicitBucketBoundaries(DefaultSizeBounds...))
-	h.serverMetrics.callDuration = createFloat64Histogram(metrics.metrics, "grpc.server.call.duration", meter, otelmetric.WithUnit("s"), otelmetric.WithDescription("End-to-end time taken to complete a call from server transport's perspective."), otelmetric.WithExplicitBucketBoundaries(DefaultLatencyBounds...))
+	h.serverMetrics.callStarted = createInt64Counter(metrics.Metrics(), "grpc.server.call.started", meter, otelmetric.WithUnit("{call}"), otelmetric.WithDescription("Number of server calls started."))
+	h.serverMetrics.callSentTotalCompressedMessageSize = createInt64Histogram(metrics.Metrics(), "grpc.server.call.sent_total_compressed_message_size", meter, otelmetric.WithUnit("By"), otelmetric.WithDescription("Compressed message bytes sent per server call."), otelmetric.WithExplicitBucketBoundaries(DefaultSizeBounds...))
+	h.serverMetrics.callRcvdTotalCompressedMessageSize = createInt64Histogram(metrics.Metrics(), "grpc.server.call.rcvd_total_compressed_message_size", meter, otelmetric.WithUnit("By"), otelmetric.WithDescription("Compressed message bytes received per server call."), otelmetric.WithExplicitBucketBoundaries(DefaultSizeBounds...))
+	h.serverMetrics.callDuration = createFloat64Histogram(metrics.Metrics(), "grpc.server.call.duration", meter, otelmetric.WithUnit("s"), otelmetric.WithDescription("End-to-end time taken to complete a call from server transport's perspective."), otelmetric.WithExplicitBucketBoundaries(DefaultLatencyBounds...))
+
+	rm := &registryMetrics{
+		optionalLabels: h.options.MetricsOptions.OptionalLabels,
+	}
+	h.MetricsRecorder = rm
+	rm.registerMetrics(metrics, meter)
 }
 
 // attachLabelsTransportStream intercepts SetHeader and SendHeader calls of the
@@ -83,7 +89,7 @@ func (s *attachLabelsTransportStream) SendHeader(md metadata.MD) error {
 	return s.ServerTransportStream.SendHeader(md)
 }
 
-func (h *serverStatsHandler) unaryInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+func (h *serverMetricsHandler) unaryInterceptor(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 	var metadataExchangeLabels metadata.MD
 	if h.options.MetricsOptions.pluginOption != nil {
 		metadataExchangeLabels = h.options.MetricsOptions.pluginOption.GetMetadata()
@@ -97,7 +103,7 @@ func (h *serverStatsHandler) unaryInterceptor(ctx context.Context, req any, info
 	}
 	ctx = grpc.NewContextWithServerTransportStream(ctx, alts)
 
-	any, err := handler(ctx, req)
+	res, err := handler(ctx, req)
 	if err != nil { // maybe trailers-only if headers haven't already been sent
 		if !alts.attachedLabels.Swap(true) {
 			alts.SetTrailer(alts.metadataExchangeLabels)
@@ -108,7 +114,7 @@ func (h *serverStatsHandler) unaryInterceptor(ctx context.Context, req any, info
 		}
 	}
 
-	return any, err
+	return res, err
 }
 
 // attachLabelsStream embeds a grpc.ServerStream, and intercepts the
@@ -144,7 +150,7 @@ func (s *attachLabelsStream) SendMsg(m any) error {
 	return s.ServerStream.SendMsg(m)
 }
 
-func (h *serverStatsHandler) streamInterceptor(srv any, ss grpc.ServerStream, ssi *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+func (h *serverMetricsHandler) streamInterceptor(srv any, ss grpc.ServerStream, _ *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 	var metadataExchangeLabels metadata.MD
 	if h.options.MetricsOptions.pluginOption != nil {
 		metadataExchangeLabels = h.options.MetricsOptions.pluginOption.GetMetadata()
@@ -164,45 +170,22 @@ func (h *serverStatsHandler) streamInterceptor(srv any, ss grpc.ServerStream, ss
 }
 
 // TagConn exists to satisfy stats.Handler.
-func (h *serverStatsHandler) TagConn(ctx context.Context, _ *stats.ConnTagInfo) context.Context {
+func (h *serverMetricsHandler) TagConn(ctx context.Context, _ *stats.ConnTagInfo) context.Context {
 	return ctx
 }
 
 // HandleConn exists to satisfy stats.Handler.
-func (h *serverStatsHandler) HandleConn(context.Context, stats.ConnStats) {}
+func (h *serverMetricsHandler) HandleConn(context.Context, stats.ConnStats) {}
 
-// TagRPC implements per RPC context management.
-func (h *serverStatsHandler) TagRPC(ctx context.Context, info *stats.RPCTagInfo) context.Context {
-	method := info.FullMethodName
-	if h.options.MetricsOptions.MethodAttributeFilter != nil {
-		if !h.options.MetricsOptions.MethodAttributeFilter(method) {
-			method = "other"
-		}
-	}
-	server := internal.ServerFromContext.(func(context.Context) *grpc.Server)(ctx)
-	if server == nil { // Shouldn't happen, defensive programming.
-		logger.Error("ctx passed into server side stats handler has no grpc server ref")
-		method = "other"
-	} else {
-		isRegisteredMethod := internal.IsRegisteredMethod.(func(*grpc.Server, string) bool)
-		if !isRegisteredMethod(server, method) {
-			method = "other"
-		}
-	}
-
-	ai := &attemptInfo{
-		startTime: time.Now(),
-		method:    removeLeadingSlash(method),
-	}
-	ri := &rpcInfo{
-		ai: ai,
-	}
-	return setRPCInfo(ctx, ri)
+// TagRPC implements per RPC context management for metrics.
+func (h *serverMetricsHandler) TagRPC(ctx context.Context, info *stats.RPCTagInfo) context.Context {
+	ctx, _ = getOrCreateServerRPCInfo(ctx, info, h.options.MetricsOptions)
+	return ctx
 }
 
-// HandleRPC implements per RPC tracing and stats implementation.
-func (h *serverStatsHandler) HandleRPC(ctx context.Context, rs stats.RPCStats) {
-	ri := getRPCInfo(ctx)
+// HandleRPC handles per RPC stats implementation.
+func (h *serverMetricsHandler) HandleRPC(ctx context.Context, rs stats.RPCStats) {
+	ri := serverRPCInfo(ctx)
 	if ri == nil {
 		logger.Error("ctx passed into server side stats handler metrics event handling has no server call data present")
 		return
@@ -210,7 +193,7 @@ func (h *serverStatsHandler) HandleRPC(ctx context.Context, rs stats.RPCStats) {
 	h.processRPCData(ctx, rs, ri.ai)
 }
 
-func (h *serverStatsHandler) processRPCData(ctx context.Context, s stats.RPCStats, ai *attemptInfo) {
+func (h *serverMetricsHandler) processRPCData(ctx context.Context, s stats.RPCStats, ai *attemptInfo) {
 	switch st := s.(type) {
 	case *stats.InHeader:
 		if ai.pluginOptionLabels == nil && h.options.MetricsOptions.pluginOption != nil {
@@ -220,7 +203,10 @@ func (h *serverStatsHandler) processRPCData(ctx context.Context, s stats.RPCStat
 			}
 			ai.pluginOptionLabels = labels
 		}
-		h.serverMetrics.callStarted.Add(ctx, 1, otelmetric.WithAttributes(otelattribute.String("grpc.method", ai.method)))
+		attrs := otelmetric.WithAttributeSet(otelattribute.NewSet(
+			otelattribute.String("grpc.method", ai.method),
+		))
+		h.serverMetrics.callStarted.Add(ctx, 1, attrs)
 	case *stats.OutPayload:
 		atomic.AddInt64(&ai.sentCompressedBytes, int64(st.CompressedLength))
 	case *stats.InPayload:
@@ -231,7 +217,7 @@ func (h *serverStatsHandler) processRPCData(ctx context.Context, s stats.RPCStat
 	}
 }
 
-func (h *serverStatsHandler) processRPCEnd(ctx context.Context, ai *attemptInfo, e *stats.End) {
+func (h *serverMetricsHandler) processRPCEnd(ctx context.Context, ai *attemptInfo, e *stats.End) {
 	latency := float64(time.Since(ai.startTime)) / float64(time.Second)
 	st := "OK"
 	if e.Error != nil {
@@ -246,22 +232,23 @@ func (h *serverStatsHandler) processRPCEnd(ctx context.Context, ai *attemptInfo,
 		attributes = append(attributes, otelattribute.String(k, v))
 	}
 
-	serverAttributeOption := otelmetric.WithAttributes(attributes...)
-	h.serverMetrics.callDuration.Record(ctx, latency, serverAttributeOption)
-	h.serverMetrics.callSentTotalCompressedMessageSize.Record(ctx, atomic.LoadInt64(&ai.sentCompressedBytes), serverAttributeOption)
-	h.serverMetrics.callRcvdTotalCompressedMessageSize.Record(ctx, atomic.LoadInt64(&ai.recvCompressedBytes), serverAttributeOption)
+	// Allocate vararg slice once.
+	opts := []otelmetric.RecordOption{otelmetric.WithAttributeSet(otelattribute.NewSet(attributes...))}
+	h.serverMetrics.callDuration.Record(ctx, latency, opts...)
+	h.serverMetrics.callSentTotalCompressedMessageSize.Record(ctx, atomic.LoadInt64(&ai.sentCompressedBytes), opts...)
+	h.serverMetrics.callRcvdTotalCompressedMessageSize.Record(ctx, atomic.LoadInt64(&ai.recvCompressedBytes), opts...)
 }
 
 const (
-	// ServerCallStarted is the number of server calls started.
-	ServerCallStarted Metric = "grpc.server.call.started"
-	// ServerCallSentCompressedTotalMessageSize is the compressed message bytes
-	// sent per server call.
-	ServerCallSentCompressedTotalMessageSize Metric = "grpc.server.call.sent_total_compressed_message_size"
-	// ServerCallRcvdCompressedTotalMessageSize is the compressed message bytes
-	// received per server call.
-	ServerCallRcvdCompressedTotalMessageSize Metric = "grpc.server.call.rcvd_total_compressed_message_size"
-	// ServerCallDuration is the end-to-end time taken to complete a call from
-	// server transport's perspective.
-	ServerCallDuration Metric = "grpc.server.call.duration"
+	// ServerCallStartedMetricName is the number of server calls started.
+	ServerCallStartedMetricName string = "grpc.server.call.started"
+	// ServerCallSentCompressedTotalMessageSizeMetricName is the compressed
+	// message bytes sent per server call.
+	ServerCallSentCompressedTotalMessageSizeMetricName string = "grpc.server.call.sent_total_compressed_message_size"
+	// ServerCallRcvdCompressedTotalMessageSizeMetricName is the compressed
+	// message bytes received per server call.
+	ServerCallRcvdCompressedTotalMessageSizeMetricName string = "grpc.server.call.rcvd_total_compressed_message_size"
+	// ServerCallDurationMetricName is the end-to-end time taken to complete a
+	// call from server transport's perspective.
+	ServerCallDurationMetricName string = "grpc.server.call.duration"
 )

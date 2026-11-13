@@ -16,7 +16,8 @@
  *
  */
 
-// Binary client is an example client.
+// Binary client demonstrates how to use ALTS credentials for secure
+// gRPC communication.
 package main
 
 import (
@@ -56,7 +57,7 @@ func main() {
 	}
 	defer conn.Close()
 
-	// Make a echo client and send an RPC.
+	// Make an echo client and send an RPC.
 	rgc := ecpb.NewEchoClient(conn)
 	callUnaryEcho(rgc, "hello world")
 }

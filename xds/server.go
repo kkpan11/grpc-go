@@ -19,37 +19,42 @@
 package xds
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"net"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/connectivity"
+	estats "google.golang.org/grpc/experimental/stats"
+	"google.golang.org/grpc/internal"
 	internalgrpclog "google.golang.org/grpc/internal/grpclog"
 	"google.golang.org/grpc/internal/grpcsync"
-	iresolver "google.golang.org/grpc/internal/resolver"
-	"google.golang.org/grpc/internal/transport"
+	istats "google.golang.org/grpc/internal/stats"
 	"google.golang.org/grpc/internal/xds/bootstrap"
-	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/status"
-	"google.golang.org/grpc/xds/internal/server"
-	"google.golang.org/grpc/xds/internal/xdsclient"
-	"google.golang.org/grpc/xds/internal/xdsclient/xdsresource"
+	"google.golang.org/grpc/internal/xds/server"
+	"google.golang.org/grpc/internal/xds/xdsclient"
 )
 
 const serverPrefix = "[xds-server %p] "
 
 var (
-	// These new functions will be overridden in unit tests.
-	newXDSClient = func() (xdsclient.XDSClient, func(), error) {
-		return xdsclient.New()
-	}
+	// These will be overridden in unit tests.
+	xdsClientPool = xdsclient.DefaultPool
 	newGRPCServer = func(opts ...grpc.ServerOption) grpcServer {
 		return grpc.NewServer(opts...)
 	}
 )
+
+func init() {
+	server.UnderlyingGRPCServer = func(s *GRPCServer) *grpc.Server {
+		if s == nil {
+			return nil
+		}
+		// Tests may replace the underlying server with a fake implementation.
+		gs, _ := s.gs.(*grpc.Server)
+		return gs
+	}
+}
 
 // grpcServer contains methods from grpc.Server which are used by the
 // GRPCServer type here. This is useful for overriding in unit tests.
@@ -69,7 +74,7 @@ type GRPCServer struct {
 	gs             grpcServer
 	quit           *grpcsync.Event
 	logger         *internalgrpclog.PrefixLogger
-	opts           *serverOptions
+	opts           *server.Options
 	xdsC           xdsclient.XDSClient
 	xdsClientClose func()
 }
@@ -78,39 +83,50 @@ type GRPCServer struct {
 // The underlying gRPC server has no service registered and has not started to
 // accept requests yet.
 func NewGRPCServer(opts ...grpc.ServerOption) (*GRPCServer, error) {
-	newOpts := []grpc.ServerOption{
-		grpc.ChainUnaryInterceptor(xdsUnaryInterceptor),
-		grpc.ChainStreamInterceptor(xdsStreamInterceptor),
+	// xdsFilterWrapper is a callback passed to the underlying gRPC server.
+	// It adapts the generic stream parameter and delegates to RouteAndProcess
+	// to execute xDS HTTP filter interceptors for each incoming RPC.
+	xDSFilterWrapper := func(ss grpc.ServerStream) (grpc.ServerStream, error) {
+		return server.RouteAndProcess(ss)
 	}
-	newOpts = append(newOpts, opts...)
+	// Construct a grpc.ServerOption that registers xDSFilterWrapper on
+	// the server.
+	xDSFilterWrapperOption := internal.XDSFilterWrapperOption.(func(func(grpc.ServerStream) (grpc.ServerStream, error)) grpc.ServerOption)
+	newOpts := append([]grpc.ServerOption{xDSFilterWrapperOption(xDSFilterWrapper)}, opts...)
 	s := &GRPCServer{
 		gs:   newGRPCServer(newOpts...),
 		quit: grpcsync.NewEvent(),
 	}
 	s.handleServerOptions(opts)
 
+	var mrl estats.MetricsRecorder
+	mrl = istats.NewMetricsRecorderList(nil)
+	if srv, ok := s.gs.(*grpc.Server); ok { // Will hit in prod but not for testing.
+		mrl = internal.MetricsRecorderForServer.(func(*grpc.Server) estats.MetricsRecorder)(srv)
+	}
+
 	// Initializing the xDS client upfront (instead of at serving time)
 	// simplifies the code by eliminating the need for a mutex to protect the
 	// xdsC and xdsClientClose fields.
-	newXDSClient := newXDSClient
-	if s.opts.bootstrapContentsForTesting != nil {
-		// Bootstrap file contents may be specified as a server option for tests.
-		newXDSClient = func() (xdsclient.XDSClient, func(), error) {
-			return xdsclient.NewForTesting(xdsclient.OptionsForTesting{Contents: s.opts.bootstrapContentsForTesting})
-		}
+	pool := xdsClientPool
+	if s.opts.ClientPoolForTesting != nil {
+		pool = s.opts.ClientPoolForTesting
 	}
-	xdsClient, xdsClientClose, err := newXDSClient()
+	xdsClient, xdsClientClose, err := pool.NewClient(xdsclient.NameForServer, mrl)
 	if err != nil {
 		return nil, fmt.Errorf("xDS client creation failed: %v", err)
 	}
 
 	// Validate the bootstrap configuration for server specific fields.
 
-	// Listener resource name template is mandatory on the server side.
-	cfg := xdsClient.BootstrapConfig()
-	if cfg.ServerListenerResourceNameTemplate() == "" {
-		xdsClientClose()
-		return nil, errors.New("missing server_listener_resource_name_template in the bootstrap configuration")
+	// Listener resource name template is mandatory on the server side unless a
+	// listener resource name override is provided.
+	if s.opts.OverrideListenerResourceName == nil {
+		cfg := xdsClient.BootstrapConfig()
+		if cfg.ServerListenerResourceNameTemplate() == "" {
+			xdsClientClose()
+			return nil, errors.New("missing server_listener_resource_name_template in the bootstrap configuration")
+		}
 	}
 
 	s.xdsC = xdsClient
@@ -126,32 +142,28 @@ func NewGRPCServer(opts ...grpc.ServerOption) (*GRPCServer, error) {
 // the user, and handles the xDS server specific options.
 func (s *GRPCServer) handleServerOptions(opts []grpc.ServerOption) {
 	so := s.defaultServerOptions()
-	for _, opt := range opts {
-		if o, ok := opt.(*serverOption); ok {
-			o.apply(so)
-		}
-	}
+	server.ApplyServerOptions(opts, so)
 	s.opts = so
 }
 
-func (s *GRPCServer) defaultServerOptions() *serverOptions {
-	return &serverOptions{
+func (s *GRPCServer) defaultServerOptions() *server.Options {
+	return &server.Options{
 		// A default serving mode change callback which simply logs at the
 		// default-visible log level. This will be used if the application does not
 		// register a mode change callback.
 		//
-		// Note that this means that `s.opts.modeCallback` will never be nil and can
+		// Note that this means that `s.opts.ModeCallback` will never be nil and can
 		// safely be invoked directly from `handleServingModeChanges`.
-		modeCallback: s.loggingServerModeChangeCallback,
+		ModeCallback: s.loggingServerModeChangeCallback,
 	}
 }
 
-func (s *GRPCServer) loggingServerModeChangeCallback(addr net.Addr, args ServingModeChangeArgs) {
-	switch args.Mode {
+func (s *GRPCServer) loggingServerModeChangeCallback(addr net.Addr, mode connectivity.ServingMode, err error) {
+	switch mode {
 	case connectivity.ServingModeServing:
-		s.logger.Errorf("Listener %q entering mode: %q", addr.String(), args.Mode)
+		s.logger.Errorf("Listener %q entering mode: %q", addr.String(), mode)
 	case connectivity.ServingModeNotServing:
-		s.logger.Errorf("Listener %q entering mode: %q due to error: %v", addr.String(), args.Mode, args.Err)
+		s.logger.Errorf("Listener %q entering mode: %q due to error: %v", addr.String(), mode, err)
 	}
 }
 
@@ -190,8 +202,14 @@ func (s *GRPCServer) Serve(lis net.Listener) error {
 	// to subscribe to for a gRPC server. If the token `%s` is present in the
 	// string, it will be replaced with the server's listening "IP:port" (e.g.,
 	// "0.0.0.0:8080", "[::]:8080").
-	cfg := s.xdsC.BootstrapConfig()
-	name := bootstrap.PopulateResourceTemplate(cfg.ServerListenerResourceNameTemplate(), lis.Addr().String())
+	var name string
+	if s.opts.OverrideListenerResourceName != nil {
+		name = s.opts.OverrideListenerResourceName(lis.Addr())
+	} else {
+		cfg := s.xdsC.BootstrapConfig()
+		name = cfg.ServerListenerResourceNameTemplate()
+		name = bootstrap.PopulateResourceTemplate(name, lis.Addr().String())
+	}
 
 	// Create a listenerWrapper which handles all functionality required by
 	// this particular instance of Serve().
@@ -199,12 +217,7 @@ func (s *GRPCServer) Serve(lis net.Listener) error {
 		Listener:             lis,
 		ListenerResourceName: name,
 		XDSClient:            s.xdsC,
-		ModeCallback: func(addr net.Addr, mode connectivity.ServingMode, err error) {
-			s.opts.modeCallback(addr, ServingModeChangeArgs{
-				Mode: mode,
-				Err:  err,
-			})
-		},
+		ModeCallback:         s.opts.ModeCallback,
 	})
 	return s.gs.Serve(lw)
 }
@@ -230,89 +243,4 @@ func (s *GRPCServer) GracefulStop() {
 	if s.xdsC != nil {
 		s.xdsClientClose()
 	}
-}
-
-// routeAndProcess routes the incoming RPC to a configured route in the route
-// table and also processes the RPC by running the incoming RPC through any HTTP
-// Filters configured.
-func routeAndProcess(ctx context.Context) error {
-	conn := transport.GetConnection(ctx)
-	cw, ok := conn.(interface {
-		UsableRouteConfiguration() xdsresource.UsableRouteConfiguration
-	})
-	if !ok {
-		return errors.New("missing virtual hosts in incoming context")
-	}
-
-	rc := cw.UsableRouteConfiguration()
-	// Error out at routing l7 level with a status code UNAVAILABLE, represents
-	// an nack before usable route configuration or resource not found for RDS
-	// or error combining LDS + RDS (Shouldn't happen).
-	if rc.Err != nil {
-		if logger.V(2) {
-			logger.Infof("RPC on connection with xDS Configuration error: %v", rc.Err)
-		}
-		return status.Error(codes.Unavailable, "error from xDS configuration for matched route configuration")
-	}
-
-	mn, ok := grpc.Method(ctx)
-	if !ok {
-		return errors.New("missing method name in incoming context")
-	}
-	md, ok := metadata.FromIncomingContext(ctx)
-	if !ok {
-		return errors.New("missing metadata in incoming context")
-	}
-	// A41 added logic to the core grpc implementation to guarantee that once
-	// the RPC gets to this point, there will be a single, unambiguous authority
-	// present in the header map.
-	authority := md.Get(":authority")
-	vh := xdsresource.FindBestMatchingVirtualHostServer(authority[0], rc.VHS)
-	if vh == nil {
-		return status.Error(codes.Unavailable, "the incoming RPC did not match a configured Virtual Host")
-	}
-
-	var rwi *xdsresource.RouteWithInterceptors
-	rpcInfo := iresolver.RPCInfo{
-		Context: ctx,
-		Method:  mn,
-	}
-	for _, r := range vh.Routes {
-		if r.M.Match(rpcInfo) {
-			// "NonForwardingAction is expected for all Routes used on server-side; a route with an inappropriate action causes
-			// RPCs matching that route to fail with UNAVAILABLE." - A36
-			if r.ActionType != xdsresource.RouteActionNonForwardingAction {
-				return status.Error(codes.Unavailable, "the incoming RPC matched to a route that was not of action type non forwarding")
-			}
-			rwi = &r
-			break
-		}
-	}
-	if rwi == nil {
-		return status.Error(codes.Unavailable, "the incoming RPC did not match a configured Route")
-	}
-	for _, interceptor := range rwi.Interceptors {
-		if err := interceptor.AllowRPC(ctx); err != nil {
-			return status.Errorf(codes.PermissionDenied, "Incoming RPC is not allowed: %v", err)
-		}
-	}
-	return nil
-}
-
-// xdsUnaryInterceptor is the unary interceptor added to the gRPC server to
-// perform any xDS specific functionality on unary RPCs.
-func xdsUnaryInterceptor(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp any, err error) {
-	if err := routeAndProcess(ctx); err != nil {
-		return nil, err
-	}
-	return handler(ctx, req)
-}
-
-// xdsStreamInterceptor is the stream interceptor added to the gRPC server to
-// perform any xDS specific functionality on streaming RPCs.
-func xdsStreamInterceptor(srv any, ss grpc.ServerStream, _ *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-	if err := routeAndProcess(ss.Context()); err != nil {
-		return err
-	}
-	return handler(srv, ss)
 }

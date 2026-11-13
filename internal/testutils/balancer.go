@@ -26,17 +26,24 @@ import (
 
 	"google.golang.org/grpc/balancer"
 	"google.golang.org/grpc/connectivity"
+	"google.golang.org/grpc/experimental/stats"
+	"google.golang.org/grpc/internal"
 	"google.golang.org/grpc/internal/grpcsync"
 	"google.golang.org/grpc/resolver"
+
+	istats "google.golang.org/grpc/internal/stats"
 )
 
 // TestSubConn implements the SubConn interface, to be used in tests.
 type TestSubConn struct {
-	tcc           *BalancerClientConn // the CC that owns this SubConn
-	id            string
-	ConnectCh     chan struct{}
-	stateListener func(balancer.SubConnState)
-	connectCalled *grpcsync.Event
+	balancer.SubConn
+	tcc            *BalancerClientConn // the CC that owns this SubConn
+	id             string
+	ConnectCh      chan struct{}
+	stateListener  func(balancer.SubConnState)
+	healthListener func(balancer.SubConnState)
+	connectCalled  *grpcsync.Event
+	Addresses      []resolver.Address
 }
 
 // NewTestSubConn returns a newly initialized SubConn.  Typically, subconns
@@ -72,7 +79,13 @@ func (tsc *TestSubConn) UpdateState(state balancer.SubConnState) {
 	<-tsc.connectCalled.Done()
 	if tsc.stateListener != nil {
 		tsc.stateListener(state)
-		return
+	}
+	// pickfirst registers a health listener synchronously while handing updates
+	// to READY. It updates the balancing state only after receiving the health
+	// update. We update the health state here so callers of tsc.UpdateState
+	// can verify picker updates as soon as UpdateState returns.
+	if state.ConnectivityState == connectivity.Ready && tsc.healthListener != nil {
+		tsc.healthListener(balancer.SubConnState{ConnectivityState: connectivity.Ready})
 	}
 }
 
@@ -91,8 +104,15 @@ func (tsc *TestSubConn) String() string {
 	return tsc.id
 }
 
+// RegisterHealthListener sends a READY update to mock a situation when no
+// health checking mechanisms are configured.
+func (tsc *TestSubConn) RegisterHealthListener(lis func(balancer.SubConnState)) {
+	tsc.healthListener = lis
+}
+
 // BalancerClientConn is a mock balancer.ClientConn used in tests.
 type BalancerClientConn struct {
+	internal.EnforceClientConnEmbedding
 	logger Logger
 
 	NewSubConnAddrsCh      chan []resolver.Address // the last 10 []Address to create subconn.
@@ -131,6 +151,7 @@ func (tcc *BalancerClientConn) NewSubConn(a []resolver.Address, o balancer.NewSu
 		ConnectCh:     make(chan struct{}, 1),
 		stateListener: o.StateListener,
 		connectCalled: grpcsync.NewEvent(),
+		Addresses:     a,
 	}
 	tcc.subConnIdx++
 	tcc.logger.Logf("testClientConn: NewSubConn(%v, %+v) => %s", a, o, sc)
@@ -145,6 +166,11 @@ func (tcc *BalancerClientConn) NewSubConn(a []resolver.Address, o balancer.NewSu
 	}
 
 	return sc, nil
+}
+
+// MetricsRecorder returns an empty MetricsRecorderList.
+func (*BalancerClientConn) MetricsRecorder() stats.MetricsRecorder {
+	return istats.NewMetricsRecorderList(nil)
 }
 
 // RemoveSubConn is a nop; tests should all be updated to use sc.Shutdown()
@@ -200,7 +226,7 @@ func (tcc *BalancerClientConn) WaitForErrPicker(ctx context.Context) error {
 	case <-ctx.Done():
 		return errors.New("timeout when waiting for an error picker")
 	case picker := <-tcc.NewPickerCh:
-		if _, perr := picker.Pick(balancer.PickInfo{}); perr == nil {
+		if _, perr := picker.Pick(balancer.PickInfo{Ctx: ctx}); perr == nil {
 			return fmt.Errorf("balancer returned a picker which is not an error picker")
 		}
 	}
@@ -218,7 +244,7 @@ func (tcc *BalancerClientConn) WaitForPickerWithErr(ctx context.Context, want er
 		case <-ctx.Done():
 			return fmt.Errorf("timeout when waiting for an error picker with %v; last picker error: %v", want, lastErr)
 		case picker := <-tcc.NewPickerCh:
-			if _, lastErr = picker.Pick(balancer.PickInfo{}); lastErr != nil && lastErr.Error() == want.Error() {
+			if _, lastErr = picker.Pick(balancer.PickInfo{Ctx: ctx}); lastErr != nil && lastErr.Error() == want.Error() {
 				return nil
 			}
 		}
@@ -266,7 +292,7 @@ func (tcc *BalancerClientConn) WaitForRoundRobinPicker(ctx context.Context, want
 			}
 			var pickerErr error
 			if err := IsRoundRobin(want, func() balancer.SubConn {
-				sc, err := p.Pick(balancer.PickInfo{})
+				sc, err := p.Pick(balancer.PickInfo{Ctx: ctx})
 				if err != nil {
 					pickerErr = err
 				} else if sc.Done != nil {
@@ -317,7 +343,7 @@ func (tcc *BalancerClientConn) WaitForPicker(ctx context.Context, f func(balance
 // iteration until where it goes wrong.
 //
 // Step 2. the return values of f should be repetitions of the same permutation.
-// E.g. if want is {a,a,b}, the check failes if f returns:
+// E.g. if want is {a,a,b}, the check fails if f returns:
 //   - {a,b,a,b,a,a}: though it satisfies step 1, the second iteration is not
 //     repeating the first iteration.
 //
@@ -379,7 +405,7 @@ type TestConstPicker struct {
 }
 
 // Pick returns the const SubConn or the error.
-func (tcp *TestConstPicker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
+func (tcp *TestConstPicker) Pick(balancer.PickInfo) (balancer.PickResult, error) {
 	if tcp.Err != nil {
 		return balancer.PickResult{}, tcp.Err
 	}

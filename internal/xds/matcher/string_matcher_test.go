@@ -128,7 +128,19 @@ func TestStringMatcherFromProto(t *testing.T) {
 					SafeRegex: &v3matcherpb.RegexMatcher{Regex: "good?regex?"},
 				},
 			},
-			wantMatcher: StringMatcher{regexMatch: regexp.MustCompile("good?regex?")},
+			wantMatcher: StringMatcher{regexMatch: regexp.MustCompile("^(?:good?regex?)$")},
+		},
+		{
+			desc: "regex with ignore case",
+			inputProto: &v3matcherpb.StringMatcher{
+				MatchPattern: &v3matcherpb.StringMatcher_SafeRegex{
+					SafeRegex: &v3matcherpb.RegexMatcher{Regex: "good?regex?"},
+				},
+				IgnoreCase: true,
+			},
+			wantMatcher: StringMatcher{
+				regexMatch: regexp.MustCompile("^(?:good?regex?)$"),
+			},
 		},
 		{
 			desc: "happy case contains",
@@ -165,27 +177,15 @@ func TestStringMatcherFromProto(t *testing.T) {
 
 func TestMatch(t *testing.T) {
 	var (
-		exactMatcher, _           = StringMatcherFromProto(&v3matcherpb.StringMatcher{MatchPattern: &v3matcherpb.StringMatcher_Exact{Exact: "exact"}})
-		prefixMatcher, _          = StringMatcherFromProto(&v3matcherpb.StringMatcher{MatchPattern: &v3matcherpb.StringMatcher_Prefix{Prefix: "prefix"}})
-		suffixMatcher, _          = StringMatcherFromProto(&v3matcherpb.StringMatcher{MatchPattern: &v3matcherpb.StringMatcher_Suffix{Suffix: "suffix"}})
-		regexMatcher, _           = StringMatcherFromProto(&v3matcherpb.StringMatcher{MatchPattern: &v3matcherpb.StringMatcher_SafeRegex{SafeRegex: &v3matcherpb.RegexMatcher{Regex: "good?regex?"}}})
-		containsMatcher, _        = StringMatcherFromProto(&v3matcherpb.StringMatcher{MatchPattern: &v3matcherpb.StringMatcher_Contains{Contains: "contains"}})
-		exactMatcherIgnoreCase, _ = StringMatcherFromProto(&v3matcherpb.StringMatcher{
-			MatchPattern: &v3matcherpb.StringMatcher_Exact{Exact: "exact"},
-			IgnoreCase:   true,
-		})
-		prefixMatcherIgnoreCase, _ = StringMatcherFromProto(&v3matcherpb.StringMatcher{
-			MatchPattern: &v3matcherpb.StringMatcher_Prefix{Prefix: "prefix"},
-			IgnoreCase:   true,
-		})
-		suffixMatcherIgnoreCase, _ = StringMatcherFromProto(&v3matcherpb.StringMatcher{
-			MatchPattern: &v3matcherpb.StringMatcher_Suffix{Suffix: "suffix"},
-			IgnoreCase:   true,
-		})
-		containsMatcherIgnoreCase, _ = StringMatcherFromProto(&v3matcherpb.StringMatcher{
-			MatchPattern: &v3matcherpb.StringMatcher_Contains{Contains: "contains"},
-			IgnoreCase:   true,
-		})
+		exactMatcher              = NewExactStringMatcher("exact", false)
+		exactMatcherIgnoreCase    = NewExactStringMatcher("exact", true)
+		prefixMatcher             = NewPrefixStringMatcher("prefix", false)
+		prefixMatcherIgnoreCase   = NewPrefixStringMatcher("prefix", true)
+		suffixMatcher             = NewSuffixStringMatcher("suffix", false)
+		suffixMatcherIgnoreCase   = NewSuffixStringMatcher("suffix", true)
+		containsMatcher           = NewContainsStringMatcher("contains", false)
+		containsMatcherIgnoreCase = NewContainsStringMatcher("contains", true)
+		regexMatcher              = NewRegexStringMatcher(regexp.MustCompile("^(?:good?regex?)$"))
 	)
 
 	tests := []struct {
@@ -312,4 +312,38 @@ func TestMatch(t *testing.T) {
 
 func newStringP(s string) *string {
 	return &s
+}
+
+func TestCompileSafeRegex(t *testing.T) {
+	tests := []struct {
+		desc      string
+		pattern   string
+		wantRegex string
+		wantErr   bool
+	}{
+		{
+			desc:      "ValidPattern",
+			pattern:   "abc",
+			wantRegex: "^(?:abc)$",
+		},
+		{
+			desc:    "UnmatchedParenthesis",
+			pattern: "abc(",
+			wantErr: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			re, err := CompileSafeRegex(test.pattern)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("CompileSafeRegex(%q) returned error %q, wantErr=%v", test.pattern, err, test.wantErr)
+			}
+			if err == nil {
+				if re.String() != test.wantRegex {
+					t.Fatalf("CompileSafeRegex(%q) = %q, want %q", test.pattern, re.String(), test.wantRegex)
+				}
+			}
+		})
+	}
 }

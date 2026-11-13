@@ -23,22 +23,22 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
+	"google.golang.org/grpc/internal/xds/bootstrap"
+	internalserver "google.golang.org/grpc/internal/xds/server"
+	"google.golang.org/grpc/internal/xds/xdsclient"
 )
-
-type serverOptions struct {
-	modeCallback                ServingModeCallbackFunc
-	bootstrapContentsForTesting []byte
-}
-
-type serverOption struct {
-	grpc.EmptyServerOption
-	apply func(*serverOptions)
-}
 
 // ServingModeCallback returns a grpc.ServerOption which allows users to
 // register a callback to get notified about serving mode changes.
 func ServingModeCallback(cb ServingModeCallbackFunc) grpc.ServerOption {
-	return &serverOption{apply: func(o *serverOptions) { o.modeCallback = cb }}
+	return internalserver.NewServerOption(func(o *internalserver.Options) {
+		o.ModeCallback = func(addr net.Addr, mode connectivity.ServingMode, err error) {
+			cb(addr, ServingModeChangeArgs{
+				Mode: mode,
+				Err:  err,
+			})
+		}
+	})
 }
 
 // ServingModeCallbackFunc is the callback that users can register to get
@@ -71,6 +71,32 @@ type ServingModeChangeArgs struct {
 //
 // Notice: This API is EXPERIMENTAL and may be changed or removed in a
 // later release.
-func BootstrapContentsForTesting(contents []byte) grpc.ServerOption {
-	return &serverOption{apply: func(o *serverOptions) { o.bootstrapContentsForTesting = contents }}
+func BootstrapContentsForTesting(bootstrapContents []byte) grpc.ServerOption {
+	config, err := bootstrap.NewConfigFromContents(bootstrapContents)
+	if err != nil {
+		logger.Warningf("Failed to parse bootstrap contents %s for server options: %v", string(bootstrapContents), err)
+		return internalserver.NewServerOption(func(o *internalserver.Options) {
+			o.ClientPoolForTesting = nil
+		})
+	}
+	return ClientPoolForTesting(xdsclient.NewPool(config))
+}
+
+// ClientPoolForTesting returns a grpc.ServerOption with the pool for xds
+// clients. It allows users to set a pool for xDS clients sharing the bootstrap
+// contents for this server.
+//
+// # Testing Only
+//
+// This function should ONLY be used for testing and may not work with some
+// other features, including the CSDS service.
+//
+// # Experimental
+//
+// Notice: This API is EXPERIMENTAL and may be changed or removed in a
+// later release.
+func ClientPoolForTesting(pool *xdsclient.Pool) grpc.ServerOption {
+	return internalserver.NewServerOption(func(o *internalserver.Options) {
+		o.ClientPoolForTesting = pool
+	})
 }

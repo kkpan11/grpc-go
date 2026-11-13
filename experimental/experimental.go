@@ -28,38 +28,58 @@ package experimental
 import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/internal"
+	"google.golang.org/grpc/mem"
 )
 
-// WithRecvBufferPool returns a grpc.DialOption that configures the use of
-// bufferPool for parsing incoming messages on a grpc.ClientConn. Depending on
-// the application's workload, this could result in reduced memory allocation.
+// SetDefaultBufferPool sets the default buffer pool used by all grpc clients
+// and servers that do not have a buffer pool configured via WithBufferPool or
+// BufferPool. It also changes the buffer pool used by the proto codec, which
+// can't be changed otherwise. The provided buffer pool must be non-nil. The
+// default value is mem.DefaultBufferPool.
 //
-// If you are unsure about how to implement a memory pool but want to utilize
-// one, begin with grpc.NewSharedBufferPool.
-//
-// Note: The shared buffer pool feature will not be active if any of the
-// following options are used: WithStatsHandler, EnableTracing, or binary
-// logging. In such cases, the shared buffer pool will be ignored.
-//
-// Note: It is not recommended to use the shared buffer pool when compression is
-// enabled.
-func WithRecvBufferPool(bufferPool grpc.SharedBufferPool) grpc.DialOption {
-	return internal.WithRecvBufferPool.(func(grpc.SharedBufferPool) grpc.DialOption)(bufferPool)
+// NOTE: this function must only be called during initialization time (i.e. in
+// an init() function), and is not thread-safe. The last caller wins.
+func SetDefaultBufferPool(bufferPool mem.BufferPool) {
+	internal.SetDefaultBufferPool.(func(mem.BufferPool))(bufferPool)
 }
 
-// RecvBufferPool returns a grpc.ServerOption that configures the server to use
-// the provided shared buffer pool for parsing incoming messages. Depending on
-// the application's workload, this could result in reduced memory allocation.
+// WithBufferPool returns a grpc.DialOption that configures the use of bufferPool
+// for parsing incoming messages on a grpc.ClientConn, and for temporary buffers
+// when marshaling outgoing messages. By default, mem.DefaultBufferPool is used,
+// and this option only exists to provide alternative buffer pool implementations
+// to the client, such as more optimized size allocations etc. However, the
+// default buffer pool is already tuned to account for many different use-cases.
 //
-// If you are unsure about how to implement a memory pool but want to utilize
-// one, begin with grpc.NewSharedBufferPool.
+// Note: The following options will interfere with the buffer pool because they
+// require a fully materialized buffer instead of a sequence of buffers:
+// EnableTracing, and binary logging. In such cases, materializing the buffer
+// will generate a lot of garbage, reducing the overall benefit from using a
+// pool.
+func WithBufferPool(bufferPool mem.BufferPool) grpc.DialOption {
+	return internal.WithBufferPool.(func(mem.BufferPool) grpc.DialOption)(bufferPool)
+}
+
+// BufferPool returns a grpc.ServerOption that configures the server to use the
+// provided buffer pool for parsing incoming messages and for temporary buffers
+// when marshaling outgoing messages. By default, mem.DefaultBufferPool is used,
+// and this option only exists to provide alternative buffer pool implementations
+// to the server, such as more optimized size allocations etc. However, the
+// default buffer pool is already tuned to account for many different use-cases.
 //
-// Note: The shared buffer pool feature will not be active if any of the
-// following options are used: StatsHandler, EnableTracing, or binary logging.
-// In such cases, the shared buffer pool will be ignored.
-//
-// Note: It is not recommended to use the shared buffer pool when compression is
-// enabled.
-func RecvBufferPool(bufferPool grpc.SharedBufferPool) grpc.ServerOption {
-	return internal.RecvBufferPool.(func(grpc.SharedBufferPool) grpc.ServerOption)(bufferPool)
+// Note: The following options will interfere with the buffer pool because they
+// require a fully materialized buffer instead of a sequence of buffers:
+// EnableTracing, and binary logging. In such cases, materializing the buffer
+// will generate a lot of garbage, reducing the overall benefit from using a
+// pool.
+func BufferPool(bufferPool mem.BufferPool) grpc.ServerOption {
+	return internal.BufferPool.(func(mem.BufferPool) grpc.ServerOption)(bufferPool)
+}
+
+// AcceptCompressors returns a CallOption that limits the values
+// advertised in the grpc-accept-encoding header for the provided RPC. The
+// supplied names must correspond to compressors registered via
+// encoding.RegisterCompressor. Passing no names advertises "identity" (no
+// compression) only.
+func AcceptCompressors(names ...string) grpc.CallOption {
+	return internal.AcceptCompressors.(func(...string) grpc.CallOption)(names...)
 }

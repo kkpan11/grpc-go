@@ -24,7 +24,6 @@ import (
 	"strconv"
 	"strings"
 
-	"google.golang.org/grpc/internal/grpcutil"
 	"google.golang.org/grpc/metadata"
 )
 
@@ -36,11 +35,11 @@ type HeaderMatcher interface {
 	String() string
 }
 
-// mdValuesFromOutgoingCtx retrieves metadata from context. If there are
+// valueFromMD retrieves metadata from context. If there are
 // multiple values, the values are concatenated with "," (comma and no space).
 //
 // All header matchers only match against the comma-concatenated string.
-func mdValuesFromOutgoingCtx(md metadata.MD, key string) (string, bool) {
+func valueFromMD(md metadata.MD, key string) (string, bool) {
 	vs, ok := md[key]
 	if !ok {
 		return "", false
@@ -57,13 +56,13 @@ type HeaderExactMatcher struct {
 
 // NewHeaderExactMatcher returns a new HeaderExactMatcher.
 func NewHeaderExactMatcher(key, exact string, invert bool) *HeaderExactMatcher {
-	return &HeaderExactMatcher{key: key, exact: exact, invert: invert}
+	return &HeaderExactMatcher{key: strings.ToLower(key), exact: exact, invert: invert}
 }
 
 // Match returns whether the passed in HTTP Headers match according to the
 // HeaderExactMatcher.
 func (hem *HeaderExactMatcher) Match(md metadata.MD) bool {
-	v, ok := mdValuesFromOutgoingCtx(md, hem.key)
+	v, ok := valueFromMD(md, hem.key)
 	if !ok {
 		return false
 	}
@@ -84,17 +83,17 @@ type HeaderRegexMatcher struct {
 
 // NewHeaderRegexMatcher returns a new HeaderRegexMatcher.
 func NewHeaderRegexMatcher(key string, re *regexp.Regexp, invert bool) *HeaderRegexMatcher {
-	return &HeaderRegexMatcher{key: key, re: re, invert: invert}
+	return &HeaderRegexMatcher{key: strings.ToLower(key), re: re, invert: invert}
 }
 
 // Match returns whether the passed in HTTP Headers match according to the
 // HeaderRegexMatcher.
 func (hrm *HeaderRegexMatcher) Match(md metadata.MD) bool {
-	v, ok := mdValuesFromOutgoingCtx(md, hrm.key)
+	v, ok := valueFromMD(md, hrm.key)
 	if !ok {
 		return false
 	}
-	return grpcutil.FullMatchWithRegex(hrm.re, v) != hrm.invert
+	return hrm.re.MatchString(v) != hrm.invert
 }
 
 func (hrm *HeaderRegexMatcher) String() string {
@@ -111,13 +110,13 @@ type HeaderRangeMatcher struct {
 
 // NewHeaderRangeMatcher returns a new HeaderRangeMatcher.
 func NewHeaderRangeMatcher(key string, start, end int64, invert bool) *HeaderRangeMatcher {
-	return &HeaderRangeMatcher{key: key, start: start, end: end, invert: invert}
+	return &HeaderRangeMatcher{key: strings.ToLower(key), start: start, end: end, invert: invert}
 }
 
 // Match returns whether the passed in HTTP Headers match according to the
 // HeaderRangeMatcher.
 func (hrm *HeaderRangeMatcher) Match(md metadata.MD) bool {
-	v, ok := mdValuesFromOutgoingCtx(md, hrm.key)
+	v, ok := valueFromMD(md, hrm.key)
 	if !ok {
 		return false
 	}
@@ -143,13 +142,13 @@ func NewHeaderPresentMatcher(key string, present bool, invert bool) *HeaderPrese
 	if invert {
 		present = !present
 	}
-	return &HeaderPresentMatcher{key: key, present: present}
+	return &HeaderPresentMatcher{key: strings.ToLower(key), present: present}
 }
 
 // Match returns whether the passed in HTTP Headers match according to the
 // HeaderPresentMatcher.
 func (hpm *HeaderPresentMatcher) Match(md metadata.MD) bool {
-	vs, ok := mdValuesFromOutgoingCtx(md, hpm.key)
+	vs, ok := valueFromMD(md, hpm.key)
 	present := ok && len(vs) > 0 // TODO: Are we sure we need this len(vs) > 0?
 	return present == hpm.present
 }
@@ -168,13 +167,13 @@ type HeaderPrefixMatcher struct {
 
 // NewHeaderPrefixMatcher returns a new HeaderPrefixMatcher.
 func NewHeaderPrefixMatcher(key string, prefix string, invert bool) *HeaderPrefixMatcher {
-	return &HeaderPrefixMatcher{key: key, prefix: prefix, invert: invert}
+	return &HeaderPrefixMatcher{key: strings.ToLower(key), prefix: prefix, invert: invert}
 }
 
 // Match returns whether the passed in HTTP Headers match according to the
 // HeaderPrefixMatcher.
 func (hpm *HeaderPrefixMatcher) Match(md metadata.MD) bool {
-	v, ok := mdValuesFromOutgoingCtx(md, hpm.key)
+	v, ok := valueFromMD(md, hpm.key)
 	if !ok {
 		return false
 	}
@@ -195,13 +194,13 @@ type HeaderSuffixMatcher struct {
 
 // NewHeaderSuffixMatcher returns a new HeaderSuffixMatcher.
 func NewHeaderSuffixMatcher(key string, suffix string, invert bool) *HeaderSuffixMatcher {
-	return &HeaderSuffixMatcher{key: key, suffix: suffix, invert: invert}
+	return &HeaderSuffixMatcher{key: strings.ToLower(key), suffix: suffix, invert: invert}
 }
 
 // Match returns whether the passed in HTTP Headers match according to the
 // HeaderSuffixMatcher.
 func (hsm *HeaderSuffixMatcher) Match(md metadata.MD) bool {
-	v, ok := mdValuesFromOutgoingCtx(md, hsm.key)
+	v, ok := valueFromMD(md, hsm.key)
 	if !ok {
 		return false
 	}
@@ -222,16 +221,16 @@ type HeaderContainsMatcher struct {
 
 // NewHeaderContainsMatcher returns a new HeaderContainsMatcher. key is the HTTP
 // Header key to match on, and contains is the value that the header should
-// should contain for a successful match. An empty contains string does not
+// contain for a successful match. An empty contains string does not
 // work, use HeaderPresentMatcher in that case.
 func NewHeaderContainsMatcher(key string, contains string, invert bool) *HeaderContainsMatcher {
-	return &HeaderContainsMatcher{key: key, contains: contains, invert: invert}
+	return &HeaderContainsMatcher{key: strings.ToLower(key), contains: contains, invert: invert}
 }
 
 // Match returns whether the passed in HTTP Headers match according to the
 // HeaderContainsMatcher.
 func (hcm *HeaderContainsMatcher) Match(md metadata.MD) bool {
-	v, ok := mdValuesFromOutgoingCtx(md, hcm.key)
+	v, ok := valueFromMD(md, hcm.key)
 	if !ok {
 		return false
 	}
@@ -253,7 +252,7 @@ type HeaderStringMatcher struct {
 // NewHeaderStringMatcher returns a new HeaderStringMatcher.
 func NewHeaderStringMatcher(key string, sm StringMatcher, invert bool) *HeaderStringMatcher {
 	return &HeaderStringMatcher{
-		key:           key,
+		key:           strings.ToLower(key),
 		stringMatcher: sm,
 		invert:        invert,
 	}
@@ -262,7 +261,7 @@ func NewHeaderStringMatcher(key string, sm StringMatcher, invert bool) *HeaderSt
 // Match returns whether the passed in HTTP Headers match according to the
 // specified StringMatcher.
 func (hsm *HeaderStringMatcher) Match(md metadata.MD) bool {
-	v, ok := mdValuesFromOutgoingCtx(md, hsm.key)
+	v, ok := valueFromMD(md, hsm.key)
 	if !ok {
 		return false
 	}

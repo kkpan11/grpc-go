@@ -52,7 +52,7 @@ var (
 )
 
 func (s) TestAddressMap_Length(t *testing.T) {
-	addrMap := NewAddressMap()
+	addrMap := NewAddressMapV2[any]()
 	if got := addrMap.Len(); got != 0 {
 		t.Fatalf("addrMap.Len() = %v; want 0", got)
 	}
@@ -72,11 +72,11 @@ func (s) TestAddressMap_Length(t *testing.T) {
 }
 
 func (s) TestAddressMap_Get(t *testing.T) {
-	addrMap := NewAddressMap()
+	addrMap := NewAddressMapV2[int]()
 	addrMap.Set(addr1, 1)
 
-	if got, ok := addrMap.Get(addr2); ok || got != nil {
-		t.Fatalf("addrMap.Get(addr1) = %v, %v; want nil, false", got, ok)
+	if got, ok := addrMap.Get(addr2); ok || got != 0 {
+		t.Fatalf("addrMap.Get(addr1) = %v, %v; want 0, false", got, ok)
 	}
 
 	addrMap.Set(addr2, 2)
@@ -85,31 +85,31 @@ func (s) TestAddressMap_Get(t *testing.T) {
 	addrMap.Set(addr5, 5)
 	addrMap.Set(addr6, 6)
 	addrMap.Set(addr7, 7) // aliases addr1
-	if got, ok := addrMap.Get(addr1); !ok || got.(int) != 7 {
+	if got, ok := addrMap.Get(addr1); !ok || got != 7 {
 		t.Fatalf("addrMap.Get(addr1) = %v, %v; want %v, true", got, ok, 7)
 	}
-	if got, ok := addrMap.Get(addr2); !ok || got.(int) != 2 {
+	if got, ok := addrMap.Get(addr2); !ok || got != 2 {
 		t.Fatalf("addrMap.Get(addr2) = %v, %v; want %v, true", got, ok, 2)
 	}
-	if got, ok := addrMap.Get(addr3); !ok || got.(int) != 3 {
+	if got, ok := addrMap.Get(addr3); !ok || got != 3 {
 		t.Fatalf("addrMap.Get(addr3) = %v, %v; want %v, true", got, ok, 3)
 	}
-	if got, ok := addrMap.Get(addr4); !ok || got.(int) != 4 {
+	if got, ok := addrMap.Get(addr4); !ok || got != 4 {
 		t.Fatalf("addrMap.Get(addr4) = %v, %v; want %v, true", got, ok, 4)
 	}
-	if got, ok := addrMap.Get(addr5); !ok || got.(int) != 5 {
+	if got, ok := addrMap.Get(addr5); !ok || got != 5 {
 		t.Fatalf("addrMap.Get(addr5) = %v, %v; want %v, true", got, ok, 5)
 	}
-	if got, ok := addrMap.Get(addr6); !ok || got.(int) != 6 {
+	if got, ok := addrMap.Get(addr6); !ok || got != 6 {
 		t.Fatalf("addrMap.Get(addr6) = %v, %v; want %v, true", got, ok, 6)
 	}
-	if got, ok := addrMap.Get(addr7); !ok || got.(int) != 7 {
+	if got, ok := addrMap.Get(addr7); !ok || got != 7 {
 		t.Fatalf("addrMap.Get(addr7) = %v, %v; want %v, true", got, ok, 7)
 	}
 }
 
 func (s) TestAddressMap_Delete(t *testing.T) {
-	addrMap := NewAddressMap()
+	addrMap := NewAddressMapV2[any]()
 	addrMap.Set(addr1, 1)
 	addrMap.Set(addr2, 2)
 	if got, want := addrMap.Len(), 2; got != want {
@@ -132,7 +132,7 @@ func (s) TestAddressMap_Delete(t *testing.T) {
 }
 
 func (s) TestAddressMap_Keys(t *testing.T) {
-	addrMap := NewAddressMap()
+	addrMap := NewAddressMapV2[int]()
 	addrMap.Set(addr1, 1)
 	addrMap.Set(addr2, 2)
 	addrMap.Set(addr3, 3)
@@ -153,7 +153,7 @@ func (s) TestAddressMap_Keys(t *testing.T) {
 }
 
 func (s) TestAddressMap_Values(t *testing.T) {
-	addrMap := NewAddressMap()
+	addrMap := NewAddressMapV2[int]()
 	addrMap.Set(addr1, 1)
 	addrMap.Set(addr2, 2)
 	addrMap.Set(addr3, 3)
@@ -163,18 +163,44 @@ func (s) TestAddressMap_Values(t *testing.T) {
 	addrMap.Set(addr7, 7) // aliases addr1
 
 	want := []int{2, 3, 4, 5, 6, 7}
-	var got []int
-	for _, v := range addrMap.Values() {
-		got = append(got, v.(int))
-	}
+	got := addrMap.Values()
 	sort.Ints(got)
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Fatalf("addrMap.Values returned unexpected elements (-want, +got):\n%v", diff)
 	}
 }
 
+func (s) TestAddressMap_All(t *testing.T) {
+	addrMap := NewAddressMapV2[int]()
+	addrMap.Set(addr1, 1)
+	addrMap.Set(addr2, 2)
+	addrMap.Set(addr3, 3)
+	addrMap.Set(addr4, 4)
+	addrMap.Set(addr5, 5)
+	addrMap.Set(addr6, 6)
+	addrMap.Set(addr7, 7) // aliases addr1
+
+	type pair struct {
+		K Address
+		V int
+	}
+
+	want := []pair{{addr1, 7}, {addr2, 2}, {addr3, 3}, {addr4, 4}, {addr5, 5}, {addr6, 6}}
+	var got []pair
+	for k, v := range addrMap.All() {
+		got = append(got, pair{k, v})
+	}
+	if d := cmp.Diff(want, got, cmp.Transformer("sort", func(in []pair) []pair {
+		out := append([]pair(nil), in...)
+		sort.Slice(out, func(i, j int) bool { return out[i].V < out[j].V })
+		return out
+	})); d != "" {
+		t.Fatalf("addrMap.All returned unexpected elements (-want, +got):\n%v", d)
+	}
+}
+
 func (s) TestEndpointMap_Length(t *testing.T) {
-	em := NewEndpointMap()
+	em := NewEndpointMap[struct{}]()
 	// Should be empty at creation time.
 	if got := em.Len(); got != 0 {
 		t.Fatalf("em.Len() = %v; want 0", got)
@@ -196,7 +222,7 @@ func (s) TestEndpointMap_Length(t *testing.T) {
 }
 
 func (s) TestEndpointMap_Get(t *testing.T) {
-	em := NewEndpointMap()
+	em := NewEndpointMap[int]()
 	em.Set(endpoint1, 1)
 	// The second endpoint endpoint21 should override.
 	em.Set(endpoint12, 1)
@@ -207,28 +233,28 @@ func (s) TestEndpointMap_Get(t *testing.T) {
 	em.Set(endpoint6, 6)
 	em.Set(endpoint7, 7)
 
-	if got, ok := em.Get(endpoint1); !ok || got.(int) != 1 {
+	if got, ok := em.Get(endpoint1); !ok || got != 1 {
 		t.Fatalf("em.Get(endpoint1) = %v, %v; want %v, true", got, ok, 1)
 	}
-	if got, ok := em.Get(endpoint12); !ok || got.(int) != 2 {
+	if got, ok := em.Get(endpoint12); !ok || got != 2 {
 		t.Fatalf("em.Get(endpoint12) = %v, %v; want %v, true", got, ok, 2)
 	}
-	if got, ok := em.Get(endpoint21); !ok || got.(int) != 2 {
+	if got, ok := em.Get(endpoint21); !ok || got != 2 {
 		t.Fatalf("em.Get(endpoint21) = %v, %v; want %v, true", got, ok, 2)
 	}
-	if got, ok := em.Get(endpoint3); !ok || got.(int) != 3 {
+	if got, ok := em.Get(endpoint3); !ok || got != 3 {
 		t.Fatalf("em.Get(endpoint1) = %v, %v; want %v, true", got, ok, 3)
 	}
-	if got, ok := em.Get(endpoint4); !ok || got.(int) != 4 {
+	if got, ok := em.Get(endpoint4); !ok || got != 4 {
 		t.Fatalf("em.Get(endpoint1) = %v, %v; want %v, true", got, ok, 4)
 	}
-	if got, ok := em.Get(endpoint5); !ok || got.(int) != 5 {
+	if got, ok := em.Get(endpoint5); !ok || got != 5 {
 		t.Fatalf("em.Get(endpoint1) = %v, %v; want %v, true", got, ok, 5)
 	}
-	if got, ok := em.Get(endpoint6); !ok || got.(int) != 6 {
+	if got, ok := em.Get(endpoint6); !ok || got != 6 {
 		t.Fatalf("em.Get(endpoint1) = %v, %v; want %v, true", got, ok, 6)
 	}
-	if got, ok := em.Get(endpoint7); !ok || got.(int) != 7 {
+	if got, ok := em.Get(endpoint7); !ok || got != 7 {
 		t.Fatalf("em.Get(endpoint1) = %v, %v; want %v, true", got, ok, 7)
 	}
 	if _, ok := em.Get(endpoint123); ok {
@@ -237,7 +263,7 @@ func (s) TestEndpointMap_Get(t *testing.T) {
 }
 
 func (s) TestEndpointMap_Delete(t *testing.T) {
-	em := NewEndpointMap()
+	em := NewEndpointMap[struct{}]()
 	// Initial state of system: [1, 2, 3, 12]
 	em.Set(endpoint1, struct{}{})
 	em.Set(endpoint2, struct{}{})
@@ -267,7 +293,7 @@ func (s) TestEndpointMap_Delete(t *testing.T) {
 }
 
 func (s) TestEndpointMap_Values(t *testing.T) {
-	em := NewEndpointMap()
+	em := NewEndpointMap[int]()
 	em.Set(endpoint1, 1)
 	// The second endpoint endpoint21 should override.
 	em.Set(endpoint12, 1)
@@ -278,12 +304,62 @@ func (s) TestEndpointMap_Values(t *testing.T) {
 	em.Set(endpoint6, 6)
 	em.Set(endpoint7, 7)
 	want := []int{1, 2, 3, 4, 5, 6, 7}
-	var got []int
-	for _, v := range em.Values() {
-		got = append(got, v.(int))
-	}
+	got := em.Values()
 	sort.Ints(got)
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Fatalf("em.Values() returned unexpected elements (-want, +got):\n%v", diff)
+	}
+}
+
+func (s) TestEndpointMap_All(t *testing.T) {
+	em := NewEndpointMap[int]()
+	em.Set(endpoint1, 1)
+	// The second endpoint endpoint21 should override.
+	em.Set(endpoint12, 1)
+	em.Set(endpoint21, 2)
+	em.Set(endpoint3, 3)
+	em.Set(endpoint4, 4)
+	em.Set(endpoint5, 5)
+	em.Set(endpoint6, 6)
+	em.Set(endpoint7, 7)
+
+	type pair struct {
+		K Endpoint
+		V int
+	}
+
+	want := []pair{{endpoint1, 1}, {endpoint21, 2}, {endpoint3, 3}, {endpoint4, 4}, {endpoint5, 5}, {endpoint6, 6}, {endpoint7, 7}}
+	var got []pair
+	for k, v := range em.All() {
+		got = append(got, pair{k, v})
+	}
+	if d := cmp.Diff(want, got, cmp.Transformer("sort", func(in []pair) []pair {
+		out := append([]pair(nil), in...)
+		sort.Slice(out, func(i, j int) bool { return out[i].V < out[j].V })
+		return out
+	})); d != "" {
+		t.Fatalf("em.All returned unexpected elements (-want, +got):\n%v", d)
+	}
+}
+
+// BenchmarkEndpointMap benchmarks map operations that are expected to run
+// faster than O(n). This test doesn't run O(n) operations including listing
+// keys and values.
+func BenchmarkEndpointMap(b *testing.B) {
+	em := NewEndpointMap[any]()
+	for i := range b.N {
+		em.Set(Endpoint{
+			Addresses: []Address{{Addr: fmt.Sprintf("%d.%d.%d.%d", i, i, i, i)}},
+		}, i)
+	}
+	for i := range b.N {
+		em.Get(Endpoint{
+			Addresses: []Address{{Addr: fmt.Sprintf("%d.%d.%d.%d", i, i, i, i)}},
+		})
+	}
+	for i := range b.N {
+		em.Delete(Endpoint{
+			Addresses: []Address{{Addr: fmt.Sprintf("%d.%d.%d.%d", i, i, i, i)}},
+		})
 	}
 }

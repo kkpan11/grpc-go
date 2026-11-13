@@ -33,6 +33,8 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 )
 
+const defaultTestTimeout = 10 * time.Second
+
 func (s) TestLog(t *testing.T) {
 	idGen.reset()
 	ml := NewTruncatingMethodLogger(10, 10)
@@ -274,15 +276,22 @@ func (s) TestLog(t *testing.T) {
 				Peer:                 nil,
 			},
 		},
-
 		// gRPC headers should be omitted.
 		{
 			config: &ClientHeader{
 				OnClientSide: false,
 				Header: map[string][]string{
-					"grpc-reserved": {"to be omitted"},
-					":authority":    {"to be omitted"},
-					"a":             {"b", "bb"},
+					"lb-token":         {"to be omitted"},
+					":path":            {"to be omitted"},
+					":authority":       {"to be omitted"},
+					"content-encoding": {"to be omitted"},
+					"content-type":     {"to be omitted"},
+					"user-agent":       {"to be omitted"},
+					"te":               {"to be omitted"},
+					"authorization":    {"Bearer to-be-omitted"},
+					"grpc-reserved":    {"to be omitted"},
+
+					"a": {"b", "bb"},
 				},
 			},
 			want: &binlogpb.GrpcLogEntry{
@@ -308,9 +317,17 @@ func (s) TestLog(t *testing.T) {
 			config: &ServerHeader{
 				OnClientSide: true,
 				Header: map[string][]string{
-					"grpc-reserved": {"to be omitted"},
-					":authority":    {"to be omitted"},
-					"a":             {"b", "bb"},
+					"lb-token":         {"to be omitted"},
+					":path":            {"to be omitted"},
+					":authority":       {"to be omitted"},
+					"content-encoding": {"to be omitted"},
+					"content-type":     {"to be omitted"},
+					"user-agent":       {"to be omitted"},
+					"te":               {"to be omitted"},
+					"authorization":    {"Bearer to-be-omitted"},
+					"grpc-reserved":    {"to be omitted"},
+
+					"a": {"b", "bb"},
 				},
 			},
 			want: &binlogpb.GrpcLogEntry{
@@ -333,10 +350,12 @@ func (s) TestLog(t *testing.T) {
 			},
 		},
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
 	for i, tc := range testCases {
 		buf.Reset()
 		tc.want.SequenceIdWithinCall = uint64(i + 1)
-		ml.Log(context.Background(), tc.config)
+		ml.Log(ctx, tc.config)
 		inSink := new(binlogpb.GrpcLogEntry)
 		if err := proto.Unmarshal(buf.Bytes()[4:], inSink); err != nil {
 			t.Errorf("failed to unmarshal bytes in sink to proto: %v", err)

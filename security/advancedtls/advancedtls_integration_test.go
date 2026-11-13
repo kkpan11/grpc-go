@@ -80,15 +80,13 @@ type greeterServer struct {
 }
 
 // sayHello is a simple implementation of the pb.GreeterServer SayHello method.
-func (greeterServer) SayHello(ctx context.Context, in *pb.HelloRequest) (*pb.HelloReply, error) {
+func (greeterServer) SayHello(_ context.Context, in *pb.HelloRequest) (*pb.HelloReply, error) {
 	return &pb.HelloReply{Message: "Hello " + in.Name}, nil
 }
 
 // TODO(ZhenLian): remove shouldFail to the function signature to provider
 // tests.
-func callAndVerify(msg string, client pb.GreeterClient, shouldFail bool) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
+func callAndVerify(ctx context.Context, msg string, client pb.GreeterClient, shouldFail bool) error {
 	_, err := client.SayHello(ctx, &pb.HelloRequest{Name: msg})
 	if want, got := shouldFail == true, err != nil; got != want {
 		return fmt.Errorf("want and got mismatch,  want shouldFail=%v, got fail=%v, rpc error: %v", want, got, err)
@@ -98,24 +96,15 @@ func callAndVerify(msg string, client pb.GreeterClient, shouldFail bool) error {
 
 // TODO(ZhenLian): remove shouldFail and add ...DialOption to the function
 // signature to provider cleaner tests.
-func callAndVerifyWithClientConn(connCtx context.Context, address string, msg string, creds credentials.TransportCredentials, shouldFail bool) (*grpc.ClientConn, pb.GreeterClient, error) {
-	var conn *grpc.ClientConn
-	var err error
-	// If we want the test to fail, we establish a non-blocking connection to
-	// avoid it hangs and killed by the context.
-	if shouldFail {
-		conn, err = grpc.DialContext(connCtx, address, grpc.WithTransportCredentials(creds))
-		if err != nil {
-			return nil, nil, fmt.Errorf("client failed to connect to %s. Error: %v", address, err)
-		}
-	} else {
-		conn, err = grpc.DialContext(connCtx, address, grpc.WithTransportCredentials(creds), grpc.WithBlock())
-		if err != nil {
-			return nil, nil, fmt.Errorf("client failed to connect to %s. Error: %v", address, err)
-		}
+func callAndVerifyWithClientConn(ctx context.Context, address string, msg string, creds credentials.TransportCredentials, shouldFail bool) (*grpc.ClientConn, pb.GreeterClient, error) {
+	// Disable service config lookups as it results in a DNS lookup which can
+	// flake in CI.
+	conn, err := grpc.NewClient(address, grpc.WithTransportCredentials(creds), grpc.WithDisableServiceConfig())
+	if err != nil {
+		return nil, nil, fmt.Errorf("client failed to connect to %s. Error: %v", address, err)
 	}
 	greetClient := pb.NewGreeterClient(conn)
-	err = callAndVerify(msg, greetClient, shouldFail)
+	err = callAndVerify(ctx, msg, greetClient, shouldFail)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -175,12 +164,12 @@ func (s) TestEnd2End(t *testing.T) {
 				}
 			},
 			clientRoot: cs.ClientTrust1,
-			clientVerifyFunc: func(params *HandshakeVerificationInfo) (*PostHandshakeVerificationResults, error) {
+			clientVerifyFunc: func(*HandshakeVerificationInfo) (*PostHandshakeVerificationResults, error) {
 				return &PostHandshakeVerificationResults{}, nil
 			},
 			clientVerificationType: CertVerification,
 			serverCert:             []tls.Certificate{cs.ServerCert1},
-			serverGetRoot: func(params *ConnectionInfo) (*RootCertificates, error) {
+			serverGetRoot: func(*ConnectionInfo) (*RootCertificates, error) {
 				switch stage.read() {
 				case 0, 1:
 					return &RootCertificates{TrustCerts: cs.ServerTrust1}, nil
@@ -188,7 +177,7 @@ func (s) TestEnd2End(t *testing.T) {
 					return &RootCertificates{TrustCerts: cs.ServerTrust2}, nil
 				}
 			},
-			serverVerifyFunc: func(params *HandshakeVerificationInfo) (*PostHandshakeVerificationResults, error) {
+			serverVerifyFunc: func(*HandshakeVerificationInfo) (*PostHandshakeVerificationResults, error) {
 				return &PostHandshakeVerificationResults{}, nil
 			},
 			serverVerificationType: CertVerification,
@@ -208,7 +197,7 @@ func (s) TestEnd2End(t *testing.T) {
 		{
 			desc:       "test the reloading feature for server identity callback and client trust callback",
 			clientCert: []tls.Certificate{cs.ClientCert1},
-			clientGetRoot: func(params *ConnectionInfo) (*RootCertificates, error) {
+			clientGetRoot: func(*ConnectionInfo) (*RootCertificates, error) {
 				switch stage.read() {
 				case 0, 1:
 					return &RootCertificates{TrustCerts: cs.ClientTrust1}, nil
@@ -216,7 +205,7 @@ func (s) TestEnd2End(t *testing.T) {
 					return &RootCertificates{TrustCerts: cs.ClientTrust2}, nil
 				}
 			},
-			clientVerifyFunc: func(params *HandshakeVerificationInfo) (*PostHandshakeVerificationResults, error) {
+			clientVerifyFunc: func(*HandshakeVerificationInfo) (*PostHandshakeVerificationResults, error) {
 				return &PostHandshakeVerificationResults{}, nil
 			},
 			clientVerificationType: CertVerification,
@@ -229,7 +218,7 @@ func (s) TestEnd2End(t *testing.T) {
 				}
 			},
 			serverRoot: cs.ServerTrust1,
-			serverVerifyFunc: func(params *HandshakeVerificationInfo) (*PostHandshakeVerificationResults, error) {
+			serverVerifyFunc: func(*HandshakeVerificationInfo) (*PostHandshakeVerificationResults, error) {
 				return &PostHandshakeVerificationResults{}, nil
 			},
 			serverVerificationType: CertVerification,
@@ -250,7 +239,7 @@ func (s) TestEnd2End(t *testing.T) {
 		{
 			desc:       "test client custom verification",
 			clientCert: []tls.Certificate{cs.ClientCert1},
-			clientGetRoot: func(params *ConnectionInfo) (*RootCertificates, error) {
+			clientGetRoot: func(*ConnectionInfo) (*RootCertificates, error) {
 				switch stage.read() {
 				case 0:
 					return &RootCertificates{TrustCerts: cs.ClientTrust1}, nil
@@ -264,7 +253,7 @@ func (s) TestEnd2End(t *testing.T) {
 				}
 				cert, err := x509.ParseCertificate(params.RawCerts[0])
 				if err != nil || cert == nil {
-					return nil, fmt.Errorf("failed to parse certificate: " + err.Error())
+					return nil, fmt.Errorf("failed to parse certificate: %v", err)
 				}
 				authzCheck := false
 				switch stage.read() {
@@ -294,7 +283,7 @@ func (s) TestEnd2End(t *testing.T) {
 				}
 			},
 			serverRoot: cs.ServerTrust1,
-			serverVerifyFunc: func(params *HandshakeVerificationInfo) (*PostHandshakeVerificationResults, error) {
+			serverVerifyFunc: func(*HandshakeVerificationInfo) (*PostHandshakeVerificationResults, error) {
 				return &PostHandshakeVerificationResults{}, nil
 			},
 			serverVerificationType: CertVerification,
@@ -314,13 +303,13 @@ func (s) TestEnd2End(t *testing.T) {
 			desc:       "TestServerCustomVerification",
 			clientCert: []tls.Certificate{cs.ClientCert1},
 			clientRoot: cs.ClientTrust1,
-			clientVerifyFunc: func(params *HandshakeVerificationInfo) (*PostHandshakeVerificationResults, error) {
+			clientVerifyFunc: func(*HandshakeVerificationInfo) (*PostHandshakeVerificationResults, error) {
 				return &PostHandshakeVerificationResults{}, nil
 			},
 			clientVerificationType: CertVerification,
 			serverCert:             []tls.Certificate{cs.ServerCert1},
 			serverRoot:             cs.ServerTrust1,
-			serverVerifyFunc: func(params *HandshakeVerificationInfo) (*PostHandshakeVerificationResults, error) {
+			serverVerifyFunc: func(*HandshakeVerificationInfo) (*PostHandshakeVerificationResults, error) {
 				switch stage.read() {
 				case 0, 2:
 					return &PostHandshakeVerificationResults{}, nil
@@ -392,7 +381,7 @@ func (s) TestEnd2End(t *testing.T) {
 			stage.increase()
 			// ------------------------Scenario 2------------------------------------
 			// stage = 1, previous connection should still succeed
-			err = callAndVerify("rpc call 2", greetClient, false)
+			err = callAndVerify(ctx, "rpc call 2", greetClient, false)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -635,7 +624,7 @@ func (s) TestPEMFileProviderEnd2End(t *testing.T) {
 					RootProvider: serverRootProvider,
 				},
 				RequireClientCert: true,
-				AdditionalPeerVerification: func(params *HandshakeVerificationInfo) (*PostHandshakeVerificationResults, error) {
+				AdditionalPeerVerification: func(*HandshakeVerificationInfo) (*PostHandshakeVerificationResults, error) {
 					return &PostHandshakeVerificationResults{}, nil
 				},
 				VerificationType: CertVerification,
@@ -658,7 +647,7 @@ func (s) TestPEMFileProviderEnd2End(t *testing.T) {
 				IdentityOptions: IdentityCertificateOptions{
 					IdentityProvider: clientIdentityProvider,
 				},
-				AdditionalPeerVerification: func(params *HandshakeVerificationInfo) (*PostHandshakeVerificationResults, error) {
+				AdditionalPeerVerification: func(*HandshakeVerificationInfo) (*PostHandshakeVerificationResults, error) {
 					return &PostHandshakeVerificationResults{}, nil
 				},
 				RootOptions: RootCertificateOptions{
@@ -684,7 +673,7 @@ func (s) TestPEMFileProviderEnd2End(t *testing.T) {
 			test.certUpdateFunc()
 			time.Sleep(sleepInterval)
 			// The already-established connection should not be affected.
-			err = callAndVerify("rpc call 2", greetClient, false)
+			err = callAndVerify(ctx, "rpc call 2", greetClient, false)
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -32,6 +32,7 @@ import (
 	"google.golang.org/grpc/internal/grpctest"
 	"google.golang.org/grpc/internal/stubserver"
 	"google.golang.org/grpc/internal/testutils/roundrobin"
+	"google.golang.org/grpc/internal/testutils/stats"
 	"google.golang.org/grpc/orca"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/resolver"
@@ -81,6 +82,14 @@ var (
 		WeightUpdatePeriod:      stringp(".050s"),
 		ErrorUtilizationPenalty: float64p(0),
 	}
+	testMetricsConfig = iwrr.LBConfig{
+		EnableOOBLoadReport:     boolp(false),
+		OOBReportingPeriod:      stringp("0.005s"),
+		BlackoutPeriod:          stringp("0s"),
+		WeightExpirationPeriod:  stringp("60s"),
+		WeightUpdatePeriod:      stringp("30s"),
+		ErrorUtilizationPenalty: float64p(0),
+	}
 )
 
 type testServer struct {
@@ -106,7 +115,7 @@ func startServer(t *testing.T, r reportType) *testServer {
 	cmr := orca.NewServerMetricsRecorder().(orca.CallMetricsRecorder)
 
 	ss := &stubserver.StubServer{
-		EmptyCallF: func(ctx context.Context, in *testpb.Empty) (*testpb.Empty, error) {
+		EmptyCallF: func(ctx context.Context, _ *testpb.Empty) (*testpb.Empty, error) {
 			if r := orca.CallMetricsRecorderFromContext(ctx); r != nil {
 				// Copy metrics from what the test set in cmr into r.
 				sm := cmr.(orca.ServerMetricsProvider).ServerMetrics()
@@ -129,7 +138,7 @@ func startServer(t *testing.T, r reportType) *testServer {
 			MinReportingInterval:  10 * time.Millisecond,
 		}
 		internal.ORCAAllowAnyMinReportingInterval.(func(so *orca.ServiceOptions))(&oso)
-		sopts = append(sopts, stubserver.RegisterServiceServerOption(func(s *grpc.Server) {
+		sopts = append(sopts, stubserver.RegisterServiceServerOption(func(s grpc.ServiceRegistrar) {
 			if err := orca.Register(s, oso); err != nil {
 				t.Fatalf("Failed to register orca service: %v", err)
 			}
@@ -193,6 +202,51 @@ func (s) TestBalancer_OneAddress(t *testing.T) {
 				time.Sleep(time.Millisecond) // Delay; test will run 100ms and should perform ~10 weight updates
 			}
 		})
+	}
+}
+
+// TestWRRMetricsBasic tests metrics emitted from the WRR balancer. It
+// configures a weighted round robin balancer as the top level balancer of a
+// ClientConn, and configures a fake stats handler on the ClientConn to receive
+// metrics. It verifies stats emitted from the Weighted Round Robin Balancer on
+// balancer startup case which triggers the first picker and scheduler update
+// before any load reports are received.
+//
+// Note that this test and others, metrics emission assertions are a snapshot
+// of the most recently emitted metrics. This is due to the nondeterminism of
+// scheduler updates with respect to test bodies, so the assertions made are
+// from the most recently synced state of the system (picker/scheduler) from the
+// test body.
+func (s) TestWRRMetricsBasic(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+
+	srv := startServer(t, reportCall)
+	sc := svcConfig(t, testMetricsConfig)
+
+	tmr := stats.NewTestMetricsRecorder()
+	if err := srv.StartClient(grpc.WithDefaultServiceConfig(sc), grpc.WithStatsHandler(tmr)); err != nil {
+		t.Fatalf("Error starting client: %v", err)
+	}
+	srv.callMetrics.SetQPS(float64(1))
+
+	if _, err := srv.Client.EmptyCall(ctx, &testpb.Empty{}); err != nil {
+		t.Fatalf("Error from EmptyCall: %v", err)
+	}
+
+	if got, _ := tmr.Metric("grpc.lb.wrr.rr_fallback"); got != 1 {
+		t.Fatalf("Unexpected data for metric %v, got: %v, want: %v", "grpc.lb.wrr.rr_fallback", got, 1)
+	}
+	if got, _ := tmr.Metric("grpc.lb.wrr.endpoint_weight_stale"); got != 0 {
+		t.Fatalf("Unexpected data for metric %v, got: %v, want: %v", "grpc.lb.wrr.endpoint_weight_stale", got, 0)
+	}
+	if got, _ := tmr.Metric("grpc.lb.wrr.endpoint_weight_not_yet_usable"); got != 1 {
+		t.Fatalf("Unexpected data for metric %v, got: %v, want: %v", "grpc.lb.wrr.endpoint_weight_not_yet_usable", got, 1)
+	}
+	// Unusable, so no endpoint weight. Due to only one SubConn, this will never
+	// update the weight. Thus, this will stay 0.
+	if got, _ := tmr.Metric("grpc.lb.wrr.endpoint_weight_stale"); got != 0 {
+		t.Fatalf("Unexpected data for metric %v, got: %v, want: %v", "grpc.lb.wrr.endpoint_weight_stale", got, 0)
 	}
 }
 
@@ -395,12 +449,71 @@ func (s) TestBalancer_TwoAddresses_OOBThenPerCall(t *testing.T) {
 
 	// Update to per-call weights.
 	c := svcConfig(t, perCallConfig)
-	parsedCfg := srv1.R.CC.ParseServiceConfig(c)
+	parsedCfg := srv1.R.CC().ParseServiceConfig(c)
 	if parsedCfg.Err != nil {
 		panic(fmt.Sprintf("Error parsing config %q: %v", c, parsedCfg.Err))
 	}
 	srv1.R.UpdateState(resolver.State{Addresses: addrs, ServiceConfig: parsedCfg})
 
+	// Wait for the weight update period to allow the new weights to be processed.
+	time.Sleep(weightUpdatePeriod)
+	checkWeights(ctx, t, srvWeight{srv1, 10}, srvWeight{srv2, 1})
+}
+
+// TestEndpoints_SharedAddress tests the case where two endpoints have the same
+// address. The expected behavior is undefined, however the program should not
+// crash.
+func (s) TestEndpoints_SharedAddress(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+
+	srv := startServer(t, reportCall)
+	sc := svcConfig(t, perCallConfig)
+	if err := srv.StartClient(grpc.WithDefaultServiceConfig(sc)); err != nil {
+		t.Fatalf("Error starting client: %v", err)
+	}
+
+	endpointsSharedAddress := []resolver.Endpoint{{Addresses: []resolver.Address{{Addr: srv.Address}}}, {Addresses: []resolver.Address{{Addr: srv.Address}}}}
+	srv.R.UpdateState(resolver.State{Endpoints: endpointsSharedAddress})
+
+	// Make some RPC's and make sure doesn't crash. It should go to one of the
+	// endpoints addresses, it's undefined which one it will choose and the load
+	// reporting might not work, but it should be able to make an RPC.
+	for i := 0; i < 10; i++ {
+		if _, err := srv.Client.EmptyCall(ctx, &testpb.Empty{}); err != nil {
+			t.Fatalf("EmptyCall failed with err: %v", err)
+		}
+	}
+}
+
+// TestEndpoints_MultipleAddresses tests WRR on endpoints with numerous
+// addresses. It configures WRR with two endpoints with one bad address followed
+// by a good address. It configures two backends that each report per call
+// metrics, each corresponding to the two endpoints good address. It then
+// asserts load is distributed as expected corresponding to the call metrics
+// received.
+func (s) TestEndpoints_MultipleAddresses(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	srv1 := startServer(t, reportCall)
+	srv2 := startServer(t, reportCall)
+
+	srv1.callMetrics.SetQPS(10.0)
+	srv1.callMetrics.SetApplicationUtilization(.1)
+
+	srv2.callMetrics.SetQPS(10.0)
+	srv2.callMetrics.SetApplicationUtilization(1.0)
+
+	sc := svcConfig(t, perCallConfig)
+	if err := srv1.StartClient(grpc.WithDefaultServiceConfig(sc)); err != nil {
+		t.Fatalf("Error starting client: %v", err)
+	}
+
+	twoEndpoints := []resolver.Endpoint{{Addresses: []resolver.Address{{Addr: "bad-address-1"}, {Addr: srv1.Address}}}, {Addresses: []resolver.Address{{Addr: "bad-address-2"}, {Addr: srv2.Address}}}}
+	srv1.R.UpdateState(resolver.State{Endpoints: twoEndpoints})
+
+	// Call each backend once to ensure the weights have been received.
+	ensureReached(ctx, t, srv1.Client, 2)
 	// Wait for the weight update period to allow the new weights to be processed.
 	time.Sleep(weightUpdatePeriod)
 	checkWeights(ctx, t, srvWeight{srv1, 10}, srvWeight{srv2, 1})
@@ -450,7 +563,7 @@ func (s) TestBalancer_TwoAddresses_ErrorPenalty(t *testing.T) {
 	newCfg := oobConfig
 	newCfg.ErrorUtilizationPenalty = float64p(0.9)
 	c := svcConfig(t, newCfg)
-	parsedCfg := srv1.R.CC.ParseServiceConfig(c)
+	parsedCfg := srv1.R.CC().ParseServiceConfig(c)
 	if parsedCfg.Err != nil {
 		panic(fmt.Sprintf("Error parsing config %q: %v", c, parsedCfg.Err))
 	}

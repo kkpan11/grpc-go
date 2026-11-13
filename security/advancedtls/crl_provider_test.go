@@ -119,7 +119,7 @@ func (s) TestFileWatcherCRLProviderConfig(t *testing.T) {
 	tooFastRefreshProvider.Close()
 
 	customCallback := func(err error) {
-		fmt.Printf("Custom error message: %v", err)
+		t.Logf("Custom error message: %v", err)
 	}
 	regularProvider, err := NewFileWatcherCRLProvider(FileWatcherOptions{
 		CRLDirectory:               testdata.Path("crl"),
@@ -142,7 +142,7 @@ func (s) TestFileWatcherCRLProviderConfig(t *testing.T) {
 // that it’s correctly processed. Additionally, we also check if number of
 // invocations of custom callback is correct.
 func (s) TestFileWatcherCRLProvider(t *testing.T) {
-	const nonCRLFilesUnderCRLDirectory = 17
+	const nonCRLFilesUnderCRLDirectory = 18
 	nonCRLFilesSet := make(map[string]struct{})
 	customCallback := func(err error) {
 		if strings.Contains(err.Error(), "BUILD") {

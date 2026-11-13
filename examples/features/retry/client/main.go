@@ -16,7 +16,8 @@
  *
  */
 
-// Binary client is an example client.
+// Binary client demonstrates how to enable and configure retry policies for
+// gRPC requests.
 package main
 
 import (
@@ -36,7 +37,6 @@ var (
 	retryPolicy = `{
 		"methodConfig": [{
 		  "name": [{"service": "grpc.examples.echo.Echo"}],
-		  "waitForReady": true,
 		  "retryPolicy": {
 			  "MaxAttempts": 4,
 			  "InitialBackoff": ".01s",
